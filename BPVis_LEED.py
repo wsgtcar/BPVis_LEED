@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 from pathlib import Path
 
 from streamlit import sidebar
@@ -81,12 +82,61 @@ with col2:
     if logo_path.exists():
         st.image(str(logo_path), width=900)
 
-# --- Ensure default
+# --- Defaults
 if "project_name" not in st.session_state:
     st.session_state["project_name"] = "LEED V5 Project"
 if "rating_system" not in st.session_state:
     st.session_state["rating_system"] = "BD+C: New Construction"
 
+# ---------- helper: load Available_Points_Cat ----------
+def load_available_points_cat(xls_file):
+    """
+    Returns a long-form DF with columns:
+      Category | Rating_System | Available_Points
+    Works with either a wide sheet (Category + rating system columns)
+    or a pre-long sheet (Category, Rating_System, Available_Points).
+    """
+    try:
+        ap = pd.read_excel(xls_file, sheet_name="Available_Points_Cat")
+    except Exception:
+        return None
+
+    # Normalize column names for detection
+    ap_cols = [str(c).strip() for c in ap.columns]
+    ap.columns = ap_cols
+    lower = {c.lower(): c for c in ap_cols}
+
+    # If already long:
+    if {"category", "rating_system", "available_points"}.issubset(lower.keys()):
+        out = ap[[lower["category"], lower["rating_system"], lower["available_points"]]].copy()
+        out.columns = ["Category", "Rating_System", "Available_Points"]
+    else:
+        # Assume wide: first column is Category (by name or first non-numeric)
+        cat_col = None
+        for c in ap_cols:
+            if c.lower() == "category":
+                cat_col = c
+                break
+        if cat_col is None:
+            # fallback: use the first non-numeric column as Category
+            non_num_cols = [c for c in ap_cols if not pd.api.types.is_numeric_dtype(ap[c])]
+            cat_col = non_num_cols[0] if non_num_cols else ap_cols[0]
+
+        rating_cols = [c for c in ap_cols if c != cat_col]
+        out = ap.melt(
+            id_vars=[cat_col],
+            value_vars=rating_cols,
+            var_name="Rating_System",
+            value_name="Available_Points"
+        )
+        out.rename(columns={cat_col: "Category"}, inplace=True)
+
+    # Clean
+    out["Category"] = out["Category"].astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
+    out["Rating_System"] = out["Rating_System"].astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
+    out["Available_Points"] = pd.to_numeric(out["Available_Points"], errors="coerce").fillna(0.0)
+
+    return out
 
 # ---------- Load & keep DF in session_state ----------
 def load_dataframe(xls_file):
@@ -181,6 +231,8 @@ if uploaded_file is not None:
     if 'df' not in st.session_state or st.session_state.get('uploaded_name') != uploaded_file.name:
         st.session_state.df = load_dataframe(uploaded_file)
         st.session_state.uploaded_name = uploaded_file.name
+        # Load Available_Points_Cat (for the separate scorecard pies)
+        st.session_state.available_points_cat = load_available_points_cat(uploaded_file)
 
 df = st.session_state.get('df', None)
 
@@ -208,48 +260,86 @@ if df is None:
 # ---------- Tabs ----------
 tab_select, tab_dashboard = st.tabs(["Credits Catalog", "Project Dashboard"])
 
-# ========== CREDITS CATALOG (unchanged) ==========
+# ========== CREDITS CATALOG ==========
 with tab_select:
+    # =========================
+    # Credit Library (selectors in an expander)
+    # =========================
     with st.expander("Credit Library", expanded=True):
-        categories = pd.unique(df['Category'].dropna())
+        # NEW: checkbox to filter to only pursued
+        show_only_pursued_catalog = st.checkbox(
+            "Show only pursued credits/options/paths",
+            value=False,
+            help="Filter the dropdowns to items marked as Pursued."
+        )
+
+        # Base source df for the catalog depending on the filter
+        src = df[df['Pursued'] == True] if show_only_pursued_catalog else df
+
+        # Categories
+        categories = pd.unique(src['Category'].dropna())
+        if len(categories) == 0 and show_only_pursued_catalog:
+            st.info("No pursued items yet. Showing all categories.")
+            src = df
+            categories = pd.unique(src['Category'].dropna())
+
         selected_category = st.selectbox("Select a LEED v5 Category", categories, key="cat")
 
-        credit_rows = (
-            df.loc[df['Category'].eq(selected_category), ['Credit_ID', 'Credit_Name']]
-            .dropna()
-            .drop_duplicates()
-        )
-        credit_rows['display'] = credit_rows['Credit_ID'].astype(str) + " " + credit_rows['Credit_Name']
+        # Credits (ID + Name for display)
+        cred_src = src.loc[src['Category'].eq(selected_category), ['Credit_ID', 'Credit_Name']].dropna().drop_duplicates()
+        if cred_src.empty and show_only_pursued_catalog:
+            st.info("No pursued credits for this category. Showing all credits.")
+            cred_src = df.loc[df['Category'].eq(selected_category), ['Credit_ID', 'Credit_Name']].dropna().drop_duplicates()
+
+        cred_src['display'] = cred_src['Credit_ID'].astype(str) + " " + cred_src['Credit_Name']
         selected_credit_display = st.selectbox(
             f"Select a {selected_category} credit",
-            credit_rows['display'],
+            cred_src['display'],
             key="credit_disp"
         )
-        selected_credit_row = credit_rows.loc[credit_rows['display'] == selected_credit_display].iloc[0]
+        selected_credit_row = cred_src.loc[cred_src['display'] == selected_credit_display].iloc[0]
         selected_credit = selected_credit_row['Credit_Name']
         selected_credit_id = selected_credit_row['Credit_ID']
 
-        credit_options = pd.unique(
-            df.loc[
+        # Options
+        opt_src = src.loc[
+            (src['Category'].eq(selected_category)) &
+            (src['Credit_ID'].eq(selected_credit_id)) &
+            (src['Credit_Name'].eq(selected_credit)),
+            'Option_Title'
+        ].dropna().drop_duplicates()
+        if opt_src.empty and show_only_pursued_catalog:
+            st.info("No pursued options for this credit. Showing all options.")
+            opt_src = df.loc[
                 (df['Category'].eq(selected_category)) &
                 (df['Credit_ID'].eq(selected_credit_id)) &
                 (df['Credit_Name'].eq(selected_credit)),
                 'Option_Title'
-            ].dropna()
-        )
-        selected_option = st.selectbox(f"Select a {selected_credit} option", credit_options, key="opt")
+            ].dropna().drop_duplicates()
 
-        option_paths = pd.unique(
-            df.loc[
+        selected_option = st.selectbox(f"Select a {selected_credit} option", opt_src, key="opt")
+
+        # Paths
+        path_src = src.loc[
+            (src['Category'].eq(selected_category)) &
+            (src['Credit_ID'].eq(selected_credit_id)) &
+            (src['Credit_Name'].eq(selected_credit)) &
+            (src['Option_Title'].eq(selected_option)),
+            'Path_Title'
+        ].dropna().drop_duplicates()
+        if path_src.empty and show_only_pursued_catalog:
+            st.info("No pursued paths for this option. Showing all paths.")
+            path_src = df.loc[
                 (df['Category'].eq(selected_category)) &
                 (df['Credit_ID'].eq(selected_credit_id)) &
                 (df['Credit_Name'].eq(selected_credit)) &
                 (df['Option_Title'].eq(selected_option)),
                 'Path_Title'
-            ].dropna()
-        )
-        selected_path = st.selectbox(f"Select a {selected_option} path", option_paths, key="path")
+            ].dropna().drop_duplicates()
 
+        selected_path = st.selectbox(f"Select a {selected_option} path", path_src, key="path")
+
+    # --- Final mask for this exact selection ---
     mask = (
         df['Category'].eq(selected_category) &
         df['Credit_ID'].eq(selected_credit_id) &
@@ -258,6 +348,7 @@ with tab_select:
         df['Path_Title'].eq(selected_path)
     )
 
+    # Pull Requirement / Points / Thresholds / And / Or for this selection
     req_series = df.loc[mask, 'Requirement'].dropna().drop_duplicates()
     pts_series = df.loc[mask, 'Max_Points_Effective'].dropna().drop_duplicates()
     thresholds_series = df.loc[mask, 'Thresholds'].dropna().drop_duplicates() if 'Thresholds' in df.columns else pd.Series([], dtype=str)
@@ -282,6 +373,7 @@ with tab_select:
             st.caption("Max Points")
             st.write(f"## {max_points}")
 
+        # Pursued + Planned Points input
         pursued_default = bool(df.loc[mask, 'Pursued'].any())
         key_base = f"{selected_category}|{selected_credit_id}|{selected_credit}|{selected_option}|{selected_path}"
         pursued_new = st.checkbox(
@@ -318,6 +410,7 @@ with tab_select:
             st.session_state.df.loc[idx, 'Pursued'] = pursued_new
             st.session_state.df.loc[idx, 'Planned_Points'] = int(planned_new)
 
+        # Dependencies
         if (('And' in df.columns) and not and_series.empty) or (('Or' in df.columns) and not or_series.empty):
             st.markdown("---")
             st.caption("Dependencies")
@@ -328,6 +421,7 @@ with tab_select:
                 or_text = str(or_series.iloc[0]).replace("\r\n", "<br>").replace("\n", "<br>")
                 st.markdown(f"**Or:**<br>{or_text}", unsafe_allow_html=True)
 
+    # Requirement
     if not req_series.empty:
         requirement = str(req_series.iloc[0])
         requirement_html = requirement.replace("\r\n", "<br>").replace("\n", "<br>")
@@ -335,11 +429,13 @@ with tab_select:
         st.write("### Requirement:")
         st.markdown(requirement_html, unsafe_allow_html=True)
 
+    # Thresholds
     if 'Thresholds' in df.columns and not thresholds_series.empty:
         thresholds_html = str(thresholds_series.iloc[0]).replace("\r\n", "<br>").replace("\n", "<br>")
         st.write("### Thresholds:")
         st.markdown(thresholds_html, unsafe_allow_html=True)
 
+    # Documentation & Referenced Standards
     doc_col = 'Documentation' if 'Documentation' in df.columns else None
     ref_col = 'Referenced_Standards' if 'Referenced_Standards' in df.columns else ('Referenced Standards' if 'Referenced Standards' in df.columns else None)
 
@@ -357,6 +453,9 @@ with tab_select:
             _ref_html = str(_ref_series.iloc[0]).replace("\r\n", "<br>").replace("\n", "<br>")
             st.markdown(_ref_html, unsafe_allow_html=True)
 
+    # =========================
+    # Design Team Strategy + Approach + Status + Responsible + Effort
+    # =========================
     st.write("### Design Team Strategy:")
     with st.expander("Approach", expanded=False):
         key_base = f"{selected_category}|{selected_credit_id}|{selected_credit}|{selected_option}|{selected_path}"
@@ -365,6 +464,7 @@ with tab_select:
         resp_key = f"responsible::{key_base}"
         effort_key = f"effort::{key_base}"
 
+        # ---- Approach (text) ----
         current_df_approach = ""
         _ser_appr = df.loc[mask, 'Approach'].dropna().astype(str)
         if not _ser_appr.empty:
@@ -385,6 +485,7 @@ with tab_select:
             st.session_state.df.loc[idx, 'Approach'] = new_text
             st.caption("Approach autosaved ✓")
 
+        # ---- Status (dropdown) ----
         current_df_status = "Not Pursued"
         _ser_status = df.loc[mask, 'Status'].dropna().astype(str)
         if not _ser_status.empty and _ser_status.iloc[0] in STATUS_OPTIONS:
@@ -406,7 +507,8 @@ with tab_select:
             st.session_state.df.loc[idx, 'Status'] = new_status
             st.caption("Status autosaved ✓")
 
-        # CSS: show full text on multiselect chips
+        # ---- Responsible (multi-select) ----
+        # CSS hack to show full text in selected tags (chips)
         st.markdown("""
         <style>
         .stMultiSelect div[data-baseweb="tag"] {
@@ -420,6 +522,7 @@ with tab_select:
         """, unsafe_allow_html=True)
 
         def parse_responsible(cell: str) -> list:
+            """Split a cell value into a list of valid stakeholders."""
             if not cell or str(cell).strip().lower() in ("nan", "none"):
                 return []
             parts = [p.strip() for chunk in str(cell).split(";") for p in chunk.split(",")]
@@ -456,6 +559,7 @@ with tab_select:
             st.session_state.df.loc[idx, 'Responsible'] = "; ".join(new_resp)
             st.caption("Responsible autosaved ✓")
 
+        # ---- Effort (dropdown) ----
         current_df_effort = "No Effort"
         _ser_eff = df.loc[mask, 'Effort'].dropna().astype(str)
         if not _ser_eff.empty and _ser_eff.iloc[0] in EFFORT_OPTIONS:
@@ -489,6 +593,12 @@ with tab_select:
             "rating_system": st.session_state.get("rating_system", "")
         }])
         proj_out.to_excel(writer, sheet_name="Project_information", index=False)
+
+        # >>> NEW: also export Available_Points_Cat if present <<<
+        ap_cat_to_save = st.session_state.get("available_points_cat", None)
+        if ap_cat_to_save is not None and not ap_cat_to_save.empty:
+            ap_cat_to_save.to_excel(writer, sheet_name="Available_Points_Cat", index=False)
+
     st.sidebar.markdown("---")
     st.sidebar.download_button(
         label="Save Project",
@@ -548,29 +658,32 @@ with tab_dashboard:
 
     col1, col2 = st.columns([3, 1])
 
+    # ---------- MAIN PIE: Planned points; enforce A→Z category order ----------
     with col1:
         if agg.empty:
             st.warning("Nothing to plot yet — mark some items as Pursued and set Planned Points.")
         else:
-            # Donut with total in center
+            agg_sorted = agg.copy().sort_values("Category", kind="stable")
+            categories_sorted_main = sorted(agg_sorted["Category"].unique().tolist())
+
             fig = px.pie(
-                agg,
+                agg_sorted,
                 names='Category',
                 values='Points',
                 hole=0.5,
                 color="Category",
                 color_discrete_map=color_map,
-                height=800
+                height=800,
+                category_orders={"Category": categories_sorted_main}
             )
             fig.update_traces(textposition='inside', textinfo='percent+value')
             fig.update_layout(
                 annotations=[dict(text=f"{total_points:.0f}", x=0.5, y=0.5,
-                                  font_size=70, showarrow=False)]
+                                  font_size=80, showarrow=False)]
             )
             st.plotly_chart(fig, use_container_width=True)
 
     # ---------- Certification + KPIs ----------
-    # Thresholds (inclusive at these values)
     thresholds = [
         ("LEED V5 Certified", 40),
         ("LEED V5 Silver", 50),
@@ -578,7 +691,6 @@ with tab_dashboard:
         ("LEED V5 Platinum", 80),
     ]
 
-    # Determine current level
     certification_level = "Not Certified"
     current_floor = 0
     next_threshold = None
@@ -589,13 +701,13 @@ with tab_dashboard:
         elif next_threshold is None and total_points < t:
             next_threshold = t
             break
-    # If already Platinum, no next level
+
     points_to_next = 0 if next_threshold is None else max(0, next_threshold - total_points)
     safety_points = max(0.0, total_points - current_floor)
     total_percentage = (total_points / 110.0) * 100.0
 
     with col2:
-
+        st.metric("Total Points", f"{total_points:.0f}")
         if certification_level == "LEED V5 Certified":
             st.image("LEED_Certified.png", width=200)
         if certification_level == "LEED V5 Silver":
@@ -606,11 +718,9 @@ with tab_dashboard:
             st.image("LEED_Platinum.png", width=200)
         st.metric("Certification", certification_level)
 
-        # New KPIs
-        st.metric("Total Points", f"{total_points:.0f}")
         st.metric("Points to Next Level", "—" if next_threshold is None else f"{points_to_next:.0f}")
-        st.metric("Safety Points in Current Level", f"{safety_points:.0f}")
-        st.metric("Total Points Percentage Achieved", f"{total_percentage:.0f}%")
+        st.metric("Safety Points", f"{safety_points:.0f}")
+        st.metric("Total Percentage", f"{total_percentage:.1f}%")
 
     # ---------- Points by Credit (no prerequisites, sorted by Credit_ID descending, legend aligned) ----------
     st.write("## Points by Credit")
@@ -684,7 +794,7 @@ with tab_dashboard:
                 yaxis=dict(categoryorder='array', categoryarray=y_order),
                 margin=dict(l=10, r=30, t=30, b=10),
                 legend_title="Category",
-                legend_traceorder="reversed"  # keep legend visually aligned with bar order
+                legend_traceorder="reversed"
             )
 
             st.plotly_chart(fig_bar, use_container_width=True)
@@ -695,17 +805,24 @@ with tab_dashboard:
         st.info("No pursued items yet.")
     else:
         with st.expander("Requirements List", expanded=False):
+            # Optional: filter to only pursued in the summary table
+            show_only_pursued_table = st.checkbox("Show only pursued credits/options/paths", value=False)
+
             details = to_sum.copy()
 
             eff_lookup = st.session_state.df[
                 ['Category', 'Credit_ID', 'Credit_Name', 'Option_Title', 'Path_Title',
-                 'Max_Points_Effective', 'Thresholds', 'Approach', 'Status', 'Responsible', 'Effort']
+                 'Max_Points_Effective', 'Thresholds', 'Approach', 'Status', 'Responsible', 'Effort', 'Pursued']
             ].copy()
             details = details.merge(
                 eff_lookup,
                 on=['Category', 'Credit_ID', 'Credit_Name', 'Option_Title', 'Path_Title'],
                 how='left'
             )
+
+            if show_only_pursued_table:
+                details = details[details['Pursued'] == True]
+
             details['Type'] = np.where(details['Max_Points_Effective'].fillna(0).eq(0), 'Prerequisite', 'Credit')
             details['Planned_Points'] = details['Planned_Points'].fillna(0).astype(int)
 
@@ -763,6 +880,58 @@ with tab_dashboard:
             """, unsafe_allow_html=True)
 
             st.dataframe(details, use_container_width=True)
+
+    # ===== Separate pies from Available_Points_Cat (LEED V5 Scorecard) =====
+    st.write("## LEED V5 Scorecard")
+    ap_cat = st.session_state.get("available_points_cat", None)
+
+    # Build a global A→Z category order from the template
+    all_cats_sorted = []
+    if ap_cat is not None and not ap_cat.empty:
+        all_cats_sorted = sorted(ap_cat["Category"].dropna().astype(str).unique().tolist())
+
+    with st.expander("Available Points per Category", expanded=False):
+        if ap_cat is None or ap_cat.empty:
+            st.info("Sheet 'Available_Points_Cat' not found or empty in the uploaded Excel.")
+        else:
+            colA, colB = st.columns(2)
+
+            def plot_available(rs_label, container):
+                subset = ap_cat[ap_cat["Rating_System"] == rs_label].copy()
+                if subset.empty:
+                    container.warning(f"No data for '{rs_label}' in Available_Points_Cat.")
+                    return
+
+                # Map available points by category
+                m = dict(zip(subset["Category"], subset["Available_Points"]))
+
+                # Use ALL categories from template, sorted A→Z
+                labels = all_cats_sorted if all_cats_sorted else sorted(subset["Category"].tolist())
+                values = [float(m.get(lbl, 0.0)) for lbl in labels]
+                colors = [color_map.get(lbl, "#CCCCCC") for lbl in labels]
+
+                fig_av = go.Figure(go.Pie(
+                    labels=labels,
+                    values=values,
+                    hole=0.5,
+                    sort=False,  # keep our alphabetical order
+                    textinfo="percent+value",
+                    marker=dict(colors=colors),
+                    hovertemplate="<b>%{label}</b><br>Available: %{value:.0f}<extra></extra>",
+                    showlegend=False
+                ))
+                fig_av.update_layout(
+                    title_text=rs_label,
+                    height=600,
+                    margin=dict(l=0, r=0, t=40, b=0),
+                    annotations=[dict(text="110", x=0.5, y=0.5, font_size=80, showarrow=False)]
+                )
+                container.plotly_chart(fig_av, use_container_width=True)
+
+            with colA:
+                plot_available("BD+C: New Construction", st)
+            with colB:
+                plot_available("BD+C: Core and Shell", st)
 
 with sidebar:
     st.caption("*A product of*")
