@@ -45,9 +45,9 @@ EFFORT_OPTIONS = [
 
 RESPONSIBLE_OPTIONS = [
     "Owner", "Operator", "Architect", "Landscape Architect", "Interior Architect",
-    "MEP Engineer", "Structural Engineer", "Electrical Engineer", "Sustainability Consultant",
-    "Facility Manager", "Comissioning Agent", "Infrastructure Engineer",
-    "Simulation Expert", "Accoustic Engineer", "Lighting Designer"
+    "MEP Engineer", "Structural Engineer", "Electrical Engineer", "Sustainability Consultant", "Building Physics",
+    "Energy Engineer","Facility Manager", "Comissioning Agent", "Infrastructure Engineer",
+    "Simulation Expert", "Accoustic Engineer", "Lighting Designer", "Contractor"
 ]
 RESPONSIBLE_DEFAULTS = ["Owner", "Sustainability Consultant", "Architect"]
 
