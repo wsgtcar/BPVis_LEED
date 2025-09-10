@@ -56,7 +56,7 @@ RESPONSIBLE_DEFAULTS = ["Owner", "Sustainability Consultant", "Architect"]
 # =========================
 st.sidebar.image("Pamo_Icon_Black.png", width=80)
 st.sidebar.write("## BPVis LEED V5 Precheck")
-st.sidebar.write("Version 0.0.1")
+st.sidebar.write("Version 1.0.0")
 
 st.sidebar.markdown("### Download Template")
 template_path = Path("templates/LEED v5 BD+C Requirements.xlsx")
@@ -135,6 +135,54 @@ def load_available_points_cat(xls_file):
     out["Category"] = out["Category"].astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
     out["Rating_System"] = out["Rating_System"].astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
     out["Available_Points"] = pd.to_numeric(out["Available_Points"], errors="coerce").fillna(0.0)
+
+    return out
+
+# ---------- NEW helper: load Available_Points_Credit ----------
+def load_available_points_credit(xls_file):
+    """
+    Returns a long-form DF with columns:
+      Credit_ID | Rating_System | Max_Credit_Points
+    Works with either a wide sheet (Credit_ID + rating system columns)
+    or a pre-long sheet (Credit_ID, Rating_System, Max_Credit_Points).
+    """
+    try:
+        apc = pd.read_excel(xls_file, sheet_name="Available_Points_Credit")
+    except Exception:
+        return None
+
+    apc_cols = [str(c).strip() for c in apc.columns]
+    apc.columns = apc_cols
+    lower = {c.lower(): c for c in apc_cols}
+
+    # Long already?
+    if {"credit_id", "rating_system", "max_credit_points"}.issubset(lower.keys()):
+        out = apc[[lower["credit_id"], lower["rating_system"], lower["max_credit_points"]]].copy()
+        out.columns = ["Credit_ID", "Rating_System", "Max_Credit_Points"]
+    else:
+        # Assume wide: first column is Credit_ID (by name or first non-numeric)
+        id_col = None
+        for c in apc_cols:
+            if c.lower() == "credit_id":
+                id_col = c
+                break
+        if id_col is None:
+            non_num_cols = [c for c in apc_cols if not pd.api.types.is_numeric_dtype(apc[c])]
+            id_col = non_num_cols[0] if non_num_cols else apc_cols[0]
+
+        rating_cols = [c for c in apc_cols if c != id_col]
+        out = apc.melt(
+            id_vars=[id_col],
+            value_vars=rating_cols,
+            var_name="Rating_System",
+            value_name="Max_Credit_Points"
+        )
+        out.rename(columns={id_col: "Credit_ID"}, inplace=True)
+
+    # Clean
+    out["Credit_ID"] = out["Credit_ID"].astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
+    out["Rating_System"] = out["Rating_System"].astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
+    out["Max_Credit_Points"] = pd.to_numeric(out["Max_Credit_Points"], errors="coerce").fillna(0)
 
     return out
 
@@ -231,8 +279,9 @@ if uploaded_file is not None:
     if 'df' not in st.session_state or st.session_state.get('uploaded_name') != uploaded_file.name:
         st.session_state.df = load_dataframe(uploaded_file)
         st.session_state.uploaded_name = uploaded_file.name
-        # Load Available_Points_Cat (for the separate scorecard pies)
+        # Load Available_Points_Cat & Credit (for charts / bars)
         st.session_state.available_points_cat = load_available_points_cat(uploaded_file)
+        st.session_state.available_points_credit = load_available_points_credit(uploaded_file)
 
 df = st.session_state.get('df', None)
 
@@ -594,10 +643,15 @@ with tab_select:
         }])
         proj_out.to_excel(writer, sheet_name="Project_information", index=False)
 
-        # >>> NEW: also export Available_Points_Cat if present <<<
+        # Export Available_Points_Cat if present
         ap_cat_to_save = st.session_state.get("available_points_cat", None)
         if ap_cat_to_save is not None and not ap_cat_to_save.empty:
             ap_cat_to_save.to_excel(writer, sheet_name="Available_Points_Cat", index=False)
+
+        # Export Available_Points_Credit if present
+        ap_credit_to_save = st.session_state.get("available_points_credit", None)
+        if ap_credit_to_save is not None and not ap_credit_to_save.empty:
+            ap_credit_to_save.to_excel(writer, sheet_name="Available_Points_Credit", index=False)
 
     st.sidebar.markdown("---")
     st.sidebar.download_button(
@@ -658,7 +712,7 @@ with tab_dashboard:
 
     col1, col2 = st.columns([3, 1])
 
-    # ---------- MAIN PIE: Planned points; enforce A→Z category order ----------
+    # ---------- MAIN PIE ----------
     with col1:
         if agg.empty:
             st.warning("Nothing to plot yet — mark some items as Pursued and set Planned Points.")
@@ -722,7 +776,7 @@ with tab_dashboard:
         st.metric("Safety Points", f"{safety_points:.0f}")
         st.metric("Total Percentage", f"{total_percentage:.1f}%")
 
-    # ---------- Points by Credit (no prerequisites, sorted by Credit_ID descending, legend aligned) ----------
+    # ---------- Points by Credit (enhanced hover: stable + detailed breakdown) ----------
     st.write("## Points by Credit")
 
     if to_sum.empty:
@@ -740,8 +794,10 @@ with tab_dashboard:
         if non_prereq.empty:
             st.info("Only prerequisites selected — no credits to plot.")
         else:
+            # Concise credit label
             non_prereq['Credit'] = non_prereq['Credit_ID'].astype(str) + " " + non_prereq['Credit_Name'].astype(str)
 
+            # Per-credit totals (planned points)
             per_credit = (
                 non_prereq.groupby(['Category', 'Credit_ID', 'Credit_Name'], as_index=False)['Planned_Points']
                 .sum()
@@ -749,29 +805,70 @@ with tab_dashboard:
             )
             per_credit['Credit'] = per_credit['Credit_ID'].astype(str) + " " + per_credit['Credit_Name'].astype(str)
 
-            # Breakdown hover
-            def row_label(r):
-                opt = str(r['Option_Title']) if pd.notna(r['Option_Title']) else ""
-                path = str(r['Path_Title']) if pd.notna(r['Path_Title']) else ""
-                bits = [b for b in [opt, path] if b and b.lower() != 'nan']
-                left = " — ".join(bits) if bits else "(no option/path)"
-                return f"{left}: {int(r['Planned_Points'])} pts"
+            # ---- Max available per credit for current rating system ----
+            ap_credit = st.session_state.get("available_points_credit", None)
+            if ap_credit is not None and not ap_credit.empty:
+                rs = st.session_state.get("rating_system", "BD+C: New Construction")
+                ap_credit_rs = ap_credit[ap_credit["Rating_System"] == rs].copy()
+                ap_credit_rs["Credit_ID"] = ap_credit_rs["Credit_ID"].astype(str).str.strip()
+                per_credit["Credit_ID"] = per_credit["Credit_ID"].astype(str).str.strip()
 
-            breakdown_src = non_prereq.copy()
-            breakdown_src['__label'] = breakdown_src.apply(row_label, axis=1)
-            breakdown = (
-                breakdown_src.groupby(['Credit_ID', 'Credit_Name'], as_index=False)['__label']
-                .apply(lambda s: "\n".join(sorted({x for x in s if isinstance(x, str) and x.strip()})))
-                .rename(columns={'__label': 'Breakdown'})
+                per_credit = per_credit.merge(
+                    ap_credit_rs[["Credit_ID", "Max_Credit_Points"]],
+                    on="Credit_ID",
+                    how="left"
+                )
+            else:
+                per_credit["Max_Credit_Points"] = np.nan
+
+            # Text label "x/y" (+ flag if exceeded)
+            def mk_label(x, y):
+                if pd.isna(y) or y == 0:
+                    return f"{int(round(x))}"
+                flag = " 🚩" if float(x) > float(y) else ""
+                return f"{int(round(x))}/{int(round(y))}{flag}"
+
+            per_credit["LabelText"] = per_credit.apply(
+                lambda r: mk_label(r["Points"], r["Max_Credit_Points"]), axis=1
             )
-            per_credit = per_credit.merge(breakdown, on=['Credit_ID', 'Credit_Name'], how='left')
 
-            # Sort by Credit_ID descending
+            # === Build stable breakdown per credit (Option/Path lines) ===
+            # First sum per Option/Path to avoid duplicates, then assemble lines
+            lines_src = (
+                non_prereq.groupby(
+                    ['Credit_ID', 'Credit_Name', 'Option_Title', 'Path_Title'],
+                    as_index=False
+                )['Planned_Points'].sum()
+            )
+
+            def line_for_row(row):
+                opt = str(row['Option_Title']) if pd.notna(row['Option_Title']) else ""
+                path = str(row['Path_Title']) if pd.notna(row['Path_Title']) else ""
+                left_bits = [b for b in [opt, path] if b and b.lower() != 'nan']
+                left = " — ".join(left_bits) if left_bits else "(no option/path)"
+                return f"{left}: {int(row['Planned_Points'])} pts"
+
+            lines_src['__line'] = lines_src.apply(line_for_row, axis=1)
+
+            breakdown_df = (
+                lines_src.sort_values(['Credit_ID', 'Option_Title', 'Path_Title'])
+                         .groupby(['Credit_ID', 'Credit_Name'], as_index=False)['__line']
+                         .apply(lambda s: "\n".join(s.tolist()))
+                         .rename(columns={'__line': 'BreakdownText'})
+            )
+
+            per_credit = per_credit.merge(breakdown_df, on=['Credit_ID', 'Credit_Name'], how='left')
+            per_credit['BreakdownText'] = per_credit['BreakdownText'].fillna("(no option/path)")
+            per_credit['BreakdownHTML'] = per_credit['BreakdownText'].str.replace("\n", "<br>", regex=False)
+            per_credit['CreditLabel'] = per_credit['Credit']  # already "ID Name"
+
+            # Sort by Credit_ID descending (define final plotting order)
             per_credit = per_credit.sort_values(['Credit_ID'], ascending=False)
             y_order = per_credit['Credit'].tolist()
 
             bar_height = max(400, min(1000, 40 * len(per_credit) + 120))
 
+            # Build bar with customdata so hover is fully controlled & aligned
             fig_bar = px.bar(
                 per_credit,
                 x='Points',
@@ -779,14 +876,18 @@ with tab_dashboard:
                 color='Category',
                 orientation='h',
                 color_discrete_map=color_map,
-                text='Points',
-                hover_data={'Category': True, 'Points': True, 'Credit': False, 'Breakdown': True}
+                text='LabelText',
+                custom_data=['CreditLabel', 'BreakdownHTML'],  # <— stable, aligned to bars
+                hover_data={'Category': False}  # we’ll override hovertemplate
             )
+
+            # Clean, bold title + breakdown lines
             fig_bar.update_traces(
-                texttemplate='%{x:.0f}',
+                hovertemplate="<b>%{customdata[0]}</b><br>%{customdata[1]}<extra></extra>",
                 textposition='outside',
                 cliponaxis=False
             )
+
             fig_bar.update_layout(
                 height=bar_height,
                 xaxis_title="Planned Points",
@@ -932,6 +1033,79 @@ with tab_dashboard:
                 plot_available("BD+C: New Construction", st)
             with colB:
                 plot_available("BD+C: Core and Shell", st)
+
+    # ====== NEW: Available Points per Credit (two side-by-side bars) ======
+    ap_credit = st.session_state.get("available_points_credit", None)
+    with st.expander("Available Points per Credit", expanded=False):
+        if ap_credit is None or ap_credit.empty:
+            st.info("Sheet 'Available_Points_Credit' not found or empty in the uploaded Excel.")
+        else:
+            # Build a Credit lookup (Category, Credit_Name) from the main DF
+            credit_lookup = (
+                st.session_state.df[['Credit_ID', 'Credit_Name', 'Category']]
+                .dropna(subset=['Credit_ID'])
+                .drop_duplicates(subset=['Credit_ID'])
+                .copy()
+            )
+            credit_lookup['Credit_ID'] = credit_lookup['Credit_ID'].astype(str).str.strip()
+
+            def render_possible_bars(rs_label, container):
+                # Filter APC by rating system
+                sub = ap_credit[ap_credit['Rating_System'] == rs_label].copy()
+                if sub.empty:
+                    container.warning(f"No data for '{rs_label}' in Available_Points_Credit.")
+                    return
+                sub['Credit_ID'] = sub['Credit_ID'].astype(str).str.strip()
+
+                # Merge category & credit name for coloring and labeling
+                merged = sub.merge(credit_lookup, on='Credit_ID', how='left')
+
+                # Label text (just the max points)
+                merged['Credit'] = merged['Credit_ID'].astype(str) + " " + merged['Credit_Name'].astype(str)
+
+                # Sort by Credit_ID descending to match main bar sorting style
+                merged = merged.sort_values(['Credit_ID'], ascending=False)
+                y_order = merged['Credit'].tolist()
+
+                # Build bar
+                bar_height = max(400, min(1000, 40 * len(merged) + 120))
+                fig_possible = px.bar(
+                    merged,
+                    x='Max_Credit_Points',
+                    y='Credit',
+                    color='Category',
+                    orientation='h',
+                    color_discrete_map=color_map,
+                    text='Max_Credit_Points',
+                    hover_data={
+                        'Category': True,
+                        'Max_Credit_Points': True,
+                        'Credit': False
+                    },
+                    title=rs_label
+                )
+                fig_possible.update_traces(
+                    texttemplate='%{x:.0f}',
+                    textposition='outside',
+                    cliponaxis=False
+                )
+                fig_possible.update_layout(
+                    height=bar_height,
+                    xaxis_title="Max Points (per credit)",
+                    yaxis_title="Credit",
+                    yaxis=dict(categoryorder='array', categoryarray=y_order),
+                    margin=dict(l=10, r=30, t=40, b=10),
+                    legend_title="Category",
+                    legend_traceorder="reversed",
+                    showlegend=False  # hide legend on these "what's possible" bars
+                )
+                container.plotly_chart(fig_possible, use_container_width=True)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                render_possible_bars("BD+C: New Construction", st)
+            with c2:
+                render_possible_bars("BD+C: Core and Shell", st)
 
 with sidebar:
     st.caption("*A product of*")
