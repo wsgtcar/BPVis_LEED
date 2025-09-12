@@ -9,6 +9,14 @@ from pathlib import Path
 
 from streamlit import sidebar
 
+# ==== NEW: for PDF & static chart export ====
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, Image as RLImage
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+import plotly.io as pio  # needs kaleido installed
+
 st.set_page_config(
     page_title="WSGT_LEED V5 Precheck Tool",
     page_icon="Pamo_Icon_White.png",
@@ -305,6 +313,274 @@ if df is not None:
 if df is None:
     st.info("Upload an Excel file to begin.")
     st.stop()
+
+# ==== PDF / REPORT HELPERS ====================================================
+def _htmlize(text: str) -> str:
+    """Convert rich cell content into safe, simple HTML paragraphs for ReportLab."""
+    if text is None:
+        return ""
+    s = str(text)
+    s = s.replace("\r\n", "\n").replace("<BR>", "\n").replace("<br/>", "\n").replace("<br>", "\n")
+    # Escape & < >
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # restore intended breaks and convert to <br/>
+    s = s.replace("&lt;br&gt;", "\n").replace("&lt;br/&gt;", "\n")
+    s = s.replace("\n", "<br/>")
+    return s
+
+def _compute_dashboard_data(df_: pd.DataFrame):
+    """Reproduce the same aggregation used in the dashboard (Planned points by Category, etc.)."""
+    pursued = df_[df_['Pursued'] == True].copy()
+    to_sum = pd.DataFrame(columns=['Category','Credit_ID','Credit_Name','Option_Title','Path_Title','Requirement','Planned_Points'])
+    agg = pd.DataFrame(columns=['Category','Points'])
+    total = 0.0
+
+    if not pursued.empty:
+        pursued['is_option_level'] = pursued['Max_Points'].isna() & pursued['Max_Points_Effective'].notna()
+        rows_path = pursued[~pursued['is_option_level']].copy()
+        rows_option = (
+            pursued[pursued['is_option_level']]
+            .groupby(['Category','Credit_ID','Credit_Name','Option_Title'], dropna=False, as_index=False)
+            .agg({'Planned_Points':'max'})
+        )
+        rows_option['Path_Title'] = np.nan
+        rows_option['Requirement'] = np.nan
+
+        to_sum = pd.concat(
+            [rows_path[['Category','Credit_ID','Credit_Name','Option_Title','Path_Title','Requirement','Planned_Points']],
+             rows_option[['Category','Credit_ID','Credit_Name','Option_Title','Path_Title','Requirement','Planned_Points']]],
+            ignore_index=True
+        )
+        agg = (to_sum.groupby('Category', as_index=False)['Planned_Points']
+               .sum().rename(columns={'Planned_Points':'Points'}))
+        total = float(agg['Points'].sum())
+
+    # Build per-credit for the bars + labels (same as UI)
+    per_credit = pd.DataFrame()
+    if not to_sum.empty:
+        non_prereq = to_sum.merge(
+            df_[['Category','Credit_ID','Credit_Name','Option_Title','Path_Title','Max_Points_Effective']],
+            on=['Category','Credit_ID','Credit_Name','Option_Title','Path_Title'],
+            how='left'
+        )
+        non_prereq = non_prereq[non_prereq['Max_Points_Effective'].fillna(0) > 0]
+        if not non_prereq.empty:
+            per_credit = (
+                non_prereq.groupby(['Category','Credit_ID','Credit_Name'], as_index=False)['Planned_Points']
+                .sum().rename(columns={'Planned_Points':'Points'})
+            )
+            per_credit['Credit'] = per_credit['Credit_ID'].astype(str) + " " + per_credit['Credit_Name'].astype(str)
+
+            ap_credit = st.session_state.get("available_points_credit", None)
+            if ap_credit is not None and not ap_credit.empty:
+                rs = st.session_state.get("rating_system", "BD+C: New Construction")
+                ap_credit_rs = ap_credit[ap_credit["Rating_System"] == rs].copy()
+                ap_credit_rs["Credit_ID"] = ap_credit_rs["Credit_ID"].astype(str).str.strip()
+                per_credit["Credit_ID"] = per_credit["Credit_ID"].astype(str).str.strip()
+                per_credit = per_credit.merge(
+                    ap_credit_rs[['Credit_ID','Max_Credit_Points']],
+                    on='Credit_ID', how='left'
+                )
+            else:
+                per_credit['Max_Credit_Points'] = np.nan
+
+            def mk_label(x,y):
+                if pd.isna(y) or y == 0:
+                    return f"{int(round(x))}"
+                flag = " 🚩" if float(x) > float(y) else ""
+                return f"{int(round(x))}/{int(round(y))}{flag}"
+            per_credit["LabelText"] = per_credit.apply(lambda r: mk_label(r["Points"], r["Max_Credit_Points"]), axis=1)
+            per_credit = per_credit.sort_values(['Credit_ID'], ascending=False)
+    return to_sum, agg, total, per_credit
+
+def _figure_bytes(fig, width=None, height=None, scale=2):
+    """Return PNG bytes from a Plotly fig using kaleido; on failure return None."""
+    try:
+        return fig.to_image(format="png", width=width, height=height, scale=scale)
+    except Exception:
+        return None
+
+def build_dashboard_page_images(df_: pd.DataFrame, color_map_: dict):
+    """Create the donut + bar charts as images for the PDF."""
+    to_sum, agg, total_points, per_credit = _compute_dashboard_data(df_)
+
+    donut_png = None
+    bars_png = None
+
+    if not agg.empty:
+        agg_sorted = agg.copy().sort_values("Category", kind="stable")
+        categories_sorted_main = sorted(agg_sorted["Category"].unique().tolist())
+        fig = px.pie(
+            agg_sorted,
+            names='Category',
+            values='Points',
+            hole=0.5,
+            color="Category",
+            color_discrete_map=color_map_,
+            height=800,
+            category_orders={"Category": categories_sorted_main}
+        )
+        fig.update_traces(textposition='inside', textinfo='percent+value')
+        fig.update_layout(annotations=[dict(text=f"{total_points:.0f}", x=0.5, y=0.5, font_size=80, showarrow=False)])
+        donut_png = _figure_bytes(fig, width=1100, height=800, scale=2)
+
+    if not per_credit.empty:
+        y_order = per_credit['Credit'].tolist()
+        bar_height = max(400, min(1000, 40 * len(per_credit) + 120))
+        fig_bar = px.bar(
+            per_credit,
+            x='Points', y='Credit', color='Category', orientation='h',
+            color_discrete_map=color_map_, text='LabelText'
+        )
+        fig_bar.update_traces(textposition='outside', cliponaxis=False)
+        fig_bar.update_layout(
+            height=bar_height, xaxis_title="Planned Points", yaxis_title="Credit",
+            yaxis=dict(categoryorder='array', categoryarray=y_order),
+            margin=dict(l=10, r=30, t=30, b=10), legend_title="Category", legend_traceorder="reversed"
+        )
+        bars_png = _figure_bytes(fig_bar, width=1100, height=bar_height, scale=2)
+
+    return donut_png, bars_png
+
+def build_full_report_pdf(df: pd.DataFrame, project_name: str, rating_system: str, color_map_: dict) -> bytes:
+    """Build a PDF: page 1 Dashboard (charts), then pursued-items detailed report."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=18*mm, rightMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm)
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle('h1', parent=styles['Heading1'], fontSize=18, spaceAfter=8, leading=22)
+    h2 = ParagraphStyle('h2', parent=styles['Heading2'], fontSize=14, spaceAfter=6, leading=18, textColor=colors.HexColor('#333333'))
+    body = ParagraphStyle('body', parent=styles['BodyText'], fontSize=10.5, leading=14, spaceAfter=6)
+    small = ParagraphStyle('small', parent=styles['BodyText'], fontSize=9.5, leading=13, spaceAfter=4)
+
+    story = []
+
+    # ===== PAGE 1: Dashboard =====
+    story.append(Paragraph(project_name, h1))
+    story.append(Paragraph(f"LEED v5 {rating_system}", body))
+    story.append(Spacer(1, 6*mm))
+
+    donut_png, bars_png = build_dashboard_page_images(df, color_map_)
+    page_width, page_height = A4
+    max_w = page_width - (doc.leftMargin + doc.rightMargin)
+
+    # Place donut (top)
+    if donut_png:
+        img1 = RLImage(io.BytesIO(donut_png))
+        # 50% scale feel: use ~max_w (it will be scaled from original)
+        img1._restrictSize(max_w, 110*mm)
+        story.append(img1)
+        story.append(Spacer(1, 4*mm))
+
+    # Place bars (below)
+    if bars_png:
+        img2 = RLImage(io.BytesIO(bars_png))
+        img2._restrictSize(max_w, 150*mm)
+        story.append(img2)
+
+    story.append(PageBreak())
+
+    # ===== PAGES 2+: Pursued content =====
+    pursued = df[df['Pursued'] == True].copy()
+    if pursued.empty:
+        story.append(Paragraph("No credits/options/paths are currently marked as <b>Pursued</b>.", body))
+        doc.build(story)
+        return buffer.getvalue()
+
+    pursued = pursued.sort_values(['Category','Credit_ID','Option_Title','Path_Title'], ascending=[True, False, True, True])
+
+    for category, cat_df in pursued.groupby('Category'):
+        story.append(Paragraph(f"Category: {category}", h2))
+        for (credit_id, credit_name), cred_df in cat_df.groupby(['Credit_ID','Credit_Name']):
+            credit_label = f"{credit_id} {credit_name}"
+            story.append(Paragraph(f"<b>{credit_label}</b>", body))
+
+            planned_sum = int(pd.to_numeric(cred_df['Planned_Points'], errors='coerce').fillna(0).sum())
+            tbl = Table([[f"Planned Points in this Credit: {planned_sum}"]], colWidths=[(page_width - doc.leftMargin - doc.rightMargin)])
+            tbl.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#f6f6f9')),
+                ('TEXTCOLOR', (0,0), (-1,-1), colors.HexColor('#333333')),
+                ('INNERGRID', (0,0), (-1,-1), 0.25, colors.HexColor('#dddddd')),
+                ('BOX', (0,0), (-1,-1), 0.5, colors.HexColor('#cccccc')),
+                ('LEFTPADDING', (0,0), (-1,-1), 6),
+                ('RIGHTPADDING', (0,0), (-1,-1), 6),
+                ('TOPPADDING', (0,0), (-1,-1), 4),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+            ]))
+            story.append(tbl)
+            story.append(Spacer(1, 2*mm))
+
+            for (option_title, path_title), row_df in cred_df.groupby(['Option_Title','Path_Title']):
+                story.append(Paragraph(f"<b>Option:</b> {option_title}", small))
+                story.append(Paragraph(f"<b>Path:</b> {path_title}", small))
+
+                # pull fields
+                def _first(series):
+                    return series.dropna().astype(str).drop_duplicates().iloc[0] if not series.dropna().empty else None
+
+                req = _first(row_df['Requirement'])
+                thr = _first(row_df['Thresholds']) if 'Thresholds' in row_df.columns else None
+                and_ = _first(row_df['And']) if 'And' in row_df.columns else None
+                or_  = _first(row_df['Or']) if 'Or' in row_df.columns else None
+                docu = _first(row_df['Documentation']) if 'Documentation' in row_df.columns else None
+                refs = None
+                if 'Referenced_Standards' in row_df.columns:
+                    refs = _first(row_df['Referenced_Standards'])
+                elif 'Referenced Standards' in row_df.columns:
+                    refs = _first(row_df['Referenced Standards'])
+                max_pts_eff = row_df['Max_Points_Effective'].dropna()
+                planned_pts = int(pd.to_numeric(row_df['Planned_Points'], errors='coerce').fillna(0).max())
+                status = _first(row_df['Status'])
+                responsible = _first(row_df['Responsible'])
+                effort = _first(row_df['Effort'])
+                approach = _first(row_df['Approach'])
+
+                pts_line = f"<b>Planned Points:</b> {planned_pts}"
+                if not max_pts_eff.empty:
+                    try:
+                        mp = int(float(max_pts_eff.max()))
+                        pts_line += f" (Max: {mp})"
+                    except Exception:
+                        pass
+                story.append(Paragraph(pts_line, small))
+
+                if status:      story.append(Paragraph(f"<b>Status:</b> {status}", small))
+                if effort:      story.append(Paragraph(f"<b>Effort:</b> {effort}", small))
+                if responsible: story.append(Paragraph(f"<b>Responsible:</b> {responsible}", small))
+
+                if approach:
+                    story.append(Paragraph("<b>Approach</b>", small))
+                    story.append(Paragraph(_htmlize(approach), small))
+
+                if req:
+                    story.append(Paragraph("<b>Requirement</b>", small))
+                    story.append(Paragraph(_htmlize(req), small))
+
+                if thr:
+                    story.append(Paragraph("<b>Thresholds</b>", small))
+                    story.append(Paragraph(_htmlize(thr), small))
+
+                if and_:
+                    story.append(Paragraph("<b>And</b>", small))
+                    story.append(Paragraph(_htmlize(and_), small))
+                if or_:
+                    story.append(Paragraph("<b>Or</b>", small))
+                    story.append(Paragraph(_htmlize(or_), small))
+
+                if docu:
+                    story.append(Paragraph("<b>Documentation</b>", small))
+                    story.append(Paragraph(_htmlize(docu), small))
+                if refs:
+                    story.append(Paragraph("<b>Referenced Standards</b>", small))
+                    story.append(Paragraph(_htmlize(refs), small))
+
+                story.append(Spacer(1, 4*mm))
+            story.append(Spacer(1, 6*mm))
+
+        story.append(PageBreak())
+
+    doc.build(story)
+    return buffer.getvalue()
+# ==== END REPORT HELPERS ======================================================
 
 # ---------- Tabs ----------
 tab_select, tab_dashboard = st.tabs(["Credits Catalog", "Project Dashboard"])
@@ -1107,6 +1383,23 @@ with tab_dashboard:
             with c2:
                 render_possible_bars("BD+C: Core and Shell", st)
 
+    # ==== EXPORT SECTION (PDF REPORT) ====
+    st.markdown("---")
+    st.write("## Export")
+    pdf_bytes = build_full_report_pdf(
+        st.session_state.df,
+        project_name=st.session_state.get("project_name", "LEED v5 Project"),
+        rating_system=st.session_state.get("rating_system", "BD+C: New Construction"),
+        color_map_=color_map
+    )
+    st.download_button(
+        label="Download Full Report (PDF)",
+        data=pdf_bytes,
+        file_name="LEED_v5_Full_Report.pdf",
+        mime="application/pdf",
+        use_container_width=True
+    )
+
 with sidebar:
     st.caption("*A product of*")
     st.image("WS_Logo.png", width=300)
@@ -1118,5 +1411,4 @@ with sidebar:
     st.caption("*Need help? Contact me under:*")
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
-
     st.caption("*Mob* +49.171.964.7850")
