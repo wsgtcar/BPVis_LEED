@@ -6,10 +6,7 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
-
 from streamlit import sidebar
-
-# ==== NEW: for PDF & static chart export ====
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, Image as RLImage
@@ -1412,3 +1409,4 @@ with sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
+
