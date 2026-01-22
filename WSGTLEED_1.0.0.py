@@ -1351,7 +1351,7 @@ with tab_select:
                 _new = st.text_area(
                     f'Comments "{_stakeholder}"',
                     key=_k,
-                    height=140,
+                    height=180,
                     help=f"Input from {_stakeholder} regarding how to meet this credit/path during Design."
                 )
 
@@ -1903,3 +1903,4 @@ with sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
+
