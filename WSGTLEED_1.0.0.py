@@ -5,8 +5,12 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import re
 from pathlib import Path
+
 from streamlit import sidebar
+
+# ==== NEW: for PDF & static chart export ====
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, Image as RLImage
@@ -49,12 +53,74 @@ EFFORT_OPTIONS = [
 ]
 
 RESPONSIBLE_OPTIONS = [
-    "Owner", "Operator", "Architect", "Landscape Architect", "Interior Architect",
+    "Owner", "Project Manager", "Operator", "Architect", "Landscape Architect", "Interior Architect",
     "MEP Engineer", "Structural Engineer", "Electrical Engineer", "Sustainability Consultant", "Building Physics",
-    "Energy Engineer","Facility Manager", "Comissioning Agent", "Infrastructure Engineer",
+    "Energy Engineer","Facility Manager", "Comissioning Authority", "Infrastructure Engineer",
     "Simulation Expert", "Accoustic Engineer", "Lighting Designer", "Contractor"
 ]
 RESPONSIBLE_DEFAULTS = ["Owner", "Sustainability Consultant", "Architect"]
+
+IMPLEMENTATION_PHASES = [f"LPH{i}" for i in range(1, 10)]
+DEFAULT_IMPLEMENTATION_PHASE = "LPH3"
+
+
+# =======================
+# Helpers
+# =======================
+def split_tokens(cell) -> list:
+    """
+    Split a delimiter-separated cell (commas/semicolons) into clean, de-duplicated tokens.
+    Returns [] for empty / NaN-like values.
+    """
+    if cell is None:
+        return []
+    try:
+        # pandas NaN support
+        import pandas as _pd
+        if _pd.isna(cell):
+            return []
+    except Exception:
+        pass
+
+    s = str(cell).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return []
+
+    parts = [p.strip() for p in s.replace(";", ",").split(",")]
+    out, seen = [], set()
+    for p in parts:
+        if not p:
+            continue
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
+
+
+def parse_responsible_valid(cell) -> list:
+    """Return only tokens that match RESPONSIBLE_OPTIONS (order preserved)."""
+    toks = split_tokens(cell)
+    return [t for t in toks if t in RESPONSIBLE_OPTIONS]
+
+
+def responsible_matches(cell, selected: list, mode: str = "any") -> bool:
+    """
+    True if the Responsible cell matches the selected stakeholders.
+    mode: "any" (intersection) or "all" (subset).
+    """
+    if not selected:
+        return True
+    toks = set(split_tokens(cell))
+    sel = set(selected)
+    if mode == "all":
+        return sel.issubset(toks)
+    return bool(toks.intersection(sel))
+
+
+def comment_colname(stakeholder: str) -> str:
+    """Column name for stakeholder-specific comments (Excel-safe, deterministic)."""
+    safe = re.sub(r'[^0-9A-Za-z]+', '_', str(stakeholder)).strip('_')
+    return f"Comments_{safe}"
 
 # =========================
 # Sidebar — template download & file upload
@@ -226,7 +292,7 @@ def load_dataframe(xls_file):
         'Requirement',
         'Thresholds', 'Tresholds', 'And', 'Or',
         'Documentation', 'Referenced_Standards', 'Referenced Standards',
-        'Approach', 'Status', 'Responsible', 'Effort'
+        'Approach', 'Status', 'Responsible', 'Effort', 'Implementation_Phase'
     ]
     for c in text_cols:
         if c in df.columns:
@@ -253,6 +319,34 @@ def load_dataframe(xls_file):
         df['Responsible'] = np.nan
     if 'Effort' not in df.columns:
         df['Effort'] = np.nan
+
+
+    # Implementation Phase
+    if 'Implementation_Phase' not in df.columns:
+        df['Implementation_Phase'] = DEFAULT_IMPLEMENTATION_PHASE
+    df['Implementation_Phase'] = df['Implementation_Phase'].fillna('').astype(str).str.strip()
+    _mask_blank_phase = (df['Implementation_Phase'].eq('') | df['Implementation_Phase'].str.lower().isin(['nan','none','null']))
+    df.loc[_mask_blank_phase, 'Implementation_Phase'] = DEFAULT_IMPLEMENTATION_PHASE
+    # Validate against allowed phases; fallback to default
+    df.loc[~df['Implementation_Phase'].isin(IMPLEMENTATION_PHASES), 'Implementation_Phase'] = DEFAULT_IMPLEMENTATION_PHASE
+
+    # Stakeholder comments (one column per stakeholder)
+    for _stakeholder in RESPONSIBLE_OPTIONS:
+        _col = comment_colname(_stakeholder)
+        if _col not in df.columns:
+            df[_col] = np.nan
+
+    # Clean comment columns (preserve NaNs)
+    for _col in [comment_colname(s) for s in RESPONSIBLE_OPTIONS if comment_colname(s) in df.columns]:
+        _na = df[_col].isna()
+        _cleaned = (
+            df[_col].astype(str)
+            .str.replace('\u00A0', ' ', regex=False)
+            .str.replace(r'\s+', ' ', regex=True)
+            .str.strip()
+        )
+        df[_col] = _cleaned
+        df.loc[_na, _col] = np.nan
 
     # Numeric
     if 'Max_Points' in df.columns:
@@ -577,17 +671,221 @@ def build_full_report_pdf(df: pd.DataFrame, project_name: str, rating_system: st
 
     doc.build(story)
     return buffer.getvalue()
+
+
+def build_filtered_catalog_report_pdf(
+    df_filtered: pd.DataFrame,
+    project_name: str,
+    rating_system: str,
+    color_map_: dict,
+    filter_state: dict | None = None,
+) -> bytes:
+    """Build a stakeholder PDF based on the Credit Library filters (incl. Responsible filter)."""
+    from datetime import datetime
+
+    filter_state = filter_state or {}
+    show_only_pursued = bool(filter_state.get("show_only_pursued", False))
+    resp_filter = filter_state.get("resp_filter", []) or []
+    resp_filter_mode = filter_state.get("resp_filter_mode", "Any")
+    phase_filter = filter_state.get("phase_filter", []) or []
+
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=18*mm, rightMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm)
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle('h1', parent=styles['Heading1'], fontSize=18, spaceAfter=8, leading=22)
+    h2 = ParagraphStyle('h2', parent=styles['Heading2'], fontSize=14, spaceAfter=6, leading=18, textColor=colors.HexColor('#333333'))
+    body = ParagraphStyle('body', parent=styles['BodyText'], fontSize=10.5, leading=14, spaceAfter=6)
+    small = ParagraphStyle('small', parent=styles['BodyText'], fontSize=9.5, leading=13, spaceAfter=4)
+
+    story = []
+    story.append(Paragraph(project_name, h1))
+    story.append(Paragraph(f"LEED v5 {rating_system}", body))
+    story.append(Paragraph("Stakeholder Requirements Report (filtered)", body))
+    story.append(Paragraph(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}", small))
+    story.append(Spacer(1, 3*mm))
+
+    # Filter summary
+    filt_lines = []
+    filt_lines.append(f"<b>Show only pursued:</b> {'Yes' if show_only_pursued else 'No'}")
+    if resp_filter:
+        filt_lines.append(f"<b>Responsible filter:</b> {', '.join(resp_filter)}")
+        filt_lines.append(f"<b>Responsible match:</b> {resp_filter_mode}")
+    else:
+        filt_lines.append("<b>Responsible filter:</b> (none)")
+
+    if phase_filter:
+        filt_lines.append(f"<b>Implementation Phase filter:</b> {', '.join(phase_filter)}")
+    else:
+        filt_lines.append("<b>Implementation Phase filter:</b> (none)")
+
+    story.append(Paragraph("<br/>".join(filt_lines), small))
+    story.append(Spacer(1, 6*mm))
+
+    # Page 1 charts (same style as Dashboard, but for the filtered subset)
+    try:
+        donut_png, bars_png = build_dashboard_page_images(df_filtered, color_map_)
+    except Exception:
+        donut_png, bars_png = (None, None)
+
+    page_width, page_height = A4
+    max_w = page_width - (doc.leftMargin + doc.rightMargin)
+
+    if donut_png:
+        img1 = RLImage(io.BytesIO(donut_png))
+        img1._restrictSize(max_w, 110*mm)
+        story.append(img1)
+        story.append(Spacer(1, 4*mm))
+    if bars_png:
+        img2 = RLImage(io.BytesIO(bars_png))
+        img2._restrictSize(max_w, 150*mm)
+        story.append(img2)
+
+    story.append(PageBreak())
+
+    # Detail pages: all filtered items (not only pursued — unless the filter already restricted it)
+    if df_filtered is None or df_filtered.empty:
+        story.append(Paragraph("No credits/options/paths match the current Credit Library filters.", body))
+        doc.build(story)
+        return buffer.getvalue()
+
+    df_rep = df_filtered.copy()
+    # Stable sort
+    for col in ['Category', 'Credit_ID', 'Credit_Name', 'Option_Title', 'Path_Title']:
+        if col not in df_rep.columns:
+            df_rep[col] = np.nan
+    df_rep = df_rep.sort_values(['Category','Credit_ID','Option_Title','Path_Title'], ascending=[True, False, True, True])
+
+    def _first(series):
+        return series.dropna().astype(str).drop_duplicates().iloc[0] if series is not None and not series.dropna().empty else None
+
+    for category, cat_df in df_rep.groupby('Category', dropna=False):
+        cat_label = str(category) if pd.notna(category) else "(No Category)"
+        story.append(Paragraph(f"Category: {cat_label}", h2))
+
+        for (credit_id, credit_name), cred_df in cat_df.groupby(['Credit_ID','Credit_Name'], dropna=False):
+            credit_label = f"{credit_id} {credit_name}".strip()
+            story.append(Paragraph(f"<b>{_htmlize(credit_label)}</b>", body))
+
+            # Credit-level summary (planned points only from pursued items)
+            cred_pursued = cred_df[cred_df.get('Pursued', False) == True].copy()
+            planned_sum = int(pd.to_numeric(cred_pursued.get('Planned_Points', 0), errors='coerce').fillna(0).sum()) if not cred_pursued.empty else 0
+            count_items = int(len(cred_df.groupby(['Option_Title','Path_Title'], dropna=False)))
+            summary_line = f"Entries in this credit (filtered): {count_items}  |  Planned points (pursued only): {planned_sum}"
+            tbl = Table([[summary_line]], colWidths=[(page_width - doc.leftMargin - doc.rightMargin)])
+            tbl.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#f6f6f9')),
+                ('TEXTCOLOR', (0,0), (-1,-1), colors.HexColor('#333333')),
+                ('INNERGRID', (0,0), (-1,-1), 0.25, colors.HexColor('#dddddd')),
+                ('BOX', (0,0), (-1,-1), 0.5, colors.HexColor('#cccccc')),
+                ('LEFTPADDING', (0,0), (-1,-1), 6),
+                ('RIGHTPADDING', (0,0), (-1,-1), 6),
+                ('TOPPADDING', (0,0), (-1,-1), 4),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+            ]))
+            story.append(tbl)
+            story.append(Spacer(1, 2*mm))
+
+            for (option_title, path_title), row_df in cred_df.groupby(['Option_Title','Path_Title'], dropna=False):
+                story.append(Paragraph(f"<b>Option:</b> {_htmlize(str(option_title))}", small))
+                story.append(Paragraph(f"<b>Path:</b> {_htmlize(str(path_title))}", small))
+
+                # Implementation phase
+                impl_phase = _first(row_df.get('Implementation_Phase')) if 'Implementation_Phase' in row_df.columns else None
+                if impl_phase:
+                    story.append(Paragraph(f"<b>Implementation Phase:</b> {_htmlize(str(impl_phase))}", small))
+
+                # Core fields
+                req = _first(row_df.get('Requirement'))
+                thr = _first(row_df.get('Thresholds')) if 'Thresholds' in row_df.columns else None
+                and_ = _first(row_df.get('And')) if 'And' in row_df.columns else None
+                or_  = _first(row_df.get('Or')) if 'Or' in row_df.columns else None
+                docu = _first(row_df.get('Documentation')) if 'Documentation' in row_df.columns else None
+                refs = None
+                if 'Referenced_Standards' in row_df.columns:
+                    refs = _first(row_df.get('Referenced_Standards'))
+                elif 'Referenced Standards' in row_df.columns:
+                    refs = _first(row_df.get('Referenced Standards'))
+
+                max_pts_eff = row_df.get('Max_Points_Effective', pd.Series(dtype=float)).dropna()
+                planned_pts = int(pd.to_numeric(row_df.get('Planned_Points', 0), errors='coerce').fillna(0).max())
+                status = _first(row_df.get('Status'))
+                responsible = _first(row_df.get('Responsible'))
+                effort = _first(row_df.get('Effort'))
+                approach = _first(row_df.get('Approach'))
+                pursued_flag = bool(row_df.get('Pursued', pd.Series([False])).fillna(False).max())
+
+                pts_line = f"<b>Pursued:</b> {'Yes' if pursued_flag else 'No'} &nbsp;&nbsp; <b>Planned Points:</b> {planned_pts}"
+                if not max_pts_eff.empty:
+                    try:
+                        mp = int(float(max_pts_eff.max()))
+                        pts_line += f" (Max: {mp})"
+                    except Exception:
+                        pass
+                story.append(Paragraph(pts_line, small))
+
+                if status:      story.append(Paragraph(f"<b>Status:</b> {_htmlize(status)}", small))
+                if effort:      story.append(Paragraph(f"<b>Effort:</b> {_htmlize(effort)}", small))
+                if responsible: story.append(Paragraph(f"<b>Responsible:</b> {_htmlize(responsible)}", small))
+
+                # Approach
+                if approach:
+                    story.append(Paragraph("<b>Approach</b>", small))
+                    story.append(Paragraph(_htmlize(approach), small))
+
+                # Stakeholder comments
+                if responsible:
+                    assigned = [t for t in split_tokens(responsible) if t in RESPONSIBLE_OPTIONS]
+                else:
+                    assigned = []
+                # Stakeholder comments for all assigned Responsible stakeholders
+                for s in assigned:
+                    col = comment_colname(s)
+                    if col in row_df.columns:
+                        comm = _first(row_df.get(col))
+                        if comm:
+                            story.append(Paragraph(f'<b>Comments "{_htmlize(s)}"</b>', small))
+                            story.append(Paragraph(_htmlize(comm), small))
+
+                # Requirement content
+                if req:
+                    story.append(Paragraph("<b>Requirement</b>", small))
+                    story.append(Paragraph(_htmlize(req), small))
+                if thr:
+                    story.append(Paragraph("<b>Thresholds</b>", small))
+                    story.append(Paragraph(_htmlize(thr), small))
+                if and_:
+                    story.append(Paragraph("<b>And</b>", small))
+                    story.append(Paragraph(_htmlize(and_), small))
+                if or_:
+                    story.append(Paragraph("<b>Or</b>", small))
+                    story.append(Paragraph(_htmlize(or_), small))
+                if docu:
+                    story.append(Paragraph("<b>Documentation</b>", small))
+                    story.append(Paragraph(_htmlize(docu), small))
+                if refs:
+                    story.append(Paragraph("<b>Referenced Standards</b>", small))
+                    story.append(Paragraph(_htmlize(refs), small))
+
+                story.append(Spacer(1, 4*mm))
+
+            story.append(Spacer(1, 6*mm))
+        story.append(PageBreak())
+
+    doc.build(story)
+    return buffer.getvalue()
+
 # ==== END REPORT HELPERS ======================================================
 
 # ---------- Tabs ----------
-tab_select, tab_dashboard = st.tabs(["Credits Catalog", "Project Dashboard"])
+tab_select, tab_dashboard = st.tabs(["Credits Library", "Project Dashboard"])
 
-# ========== CREDITS CATALOG ==========
+# ========== CREDITS Library ==========
 with tab_select:
     # =========================
     # Credit Library (selectors in an expander)
     # =========================
-    with st.expander("Credit Library", expanded=True):
+    with st.expander("Credits Library", expanded=True):
         # NEW: checkbox to filter to only pursued
         show_only_pursued_catalog = st.checkbox(
             "Show only pursued credits/options/paths",
@@ -595,8 +893,95 @@ with tab_select:
             help="Filter the dropdowns to items marked as Pursued."
         )
 
+        # NEW: filter catalog by Responsible stakeholders
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            resp_filter = st.multiselect(
+                "Filter catalog by Responsible",
+                options=["Unassigned"] + RESPONSIBLE_OPTIONS,
+                default=[],
+                key="catalog_resp_filter",
+                help="Show only credits/options/paths assigned to the selected stakeholders (based on the Responsible field)."
+            )
+        with c2:
+            resp_filter_mode = st.radio(
+                "Responsible match",
+                options=["Any", "All"],
+                index=0,
+                horizontal=True,
+                key="catalog_resp_filter_mode",
+                help="Any: match if any selected stakeholder is assigned. All: match only if all selected stakeholders are assigned."
+            )
+        # NEW: filter catalog by Implementation Phase
+        phase_filter = st.multiselect(
+            "Filter catalog by Implementation Phase",
+            options=["Unspecified"] + IMPLEMENTATION_PHASES,
+            default=[],
+            key="catalog_phase_filter",
+            help="Show only credits/options/paths matching the selected Implementation Phase values."
+        )
+
+
         # Base source df for the catalog depending on the filter
         src = df[df['Pursued'] == True] if show_only_pursued_catalog else df
+
+        # Apply Responsible filter (if set)
+        if resp_filter:
+            include_unassigned = "Unassigned" in resp_filter
+            selected_resp = [r for r in resp_filter if r != "Unassigned"]
+            mode = "all" if resp_filter_mode == "All" else "any"
+
+            col_resp = src["Responsible"] if "Responsible" in src.columns else pd.Series([""] * len(src), index=src.index)
+            if selected_resp:
+                mask_resp = col_resp.apply(lambda x: responsible_matches(x, selected_resp, mode))
+            else:
+                mask_resp = pd.Series([False] * len(src), index=src.index)
+
+            if include_unassigned:
+                col_norm = col_resp.fillna("").astype(str).str.strip()
+                mask_unassigned = (col_norm == "") | (col_norm.str.lower().isin(["nan", "none", "null"]))
+                mask_final = mask_unassigned if not selected_resp else (mask_unassigned | mask_resp)
+            else:
+                mask_final = mask_resp
+
+            src = src.loc[mask_final]
+
+            if src.empty:
+                st.warning("No items match the current Responsible filter. Showing all items.")
+                src = df[df['Pursued'] == True] if show_only_pursued_catalog else df
+
+
+        # Apply Implementation Phase filter (if set)
+        if phase_filter:
+            include_unspecified = "Unspecified" in phase_filter
+            selected_phases = [p for p in phase_filter if p != "Unspecified"]
+
+            col_phase = src["Implementation_Phase"] if "Implementation_Phase" in src.columns else pd.Series([""] * len(src), index=src.index)
+            col_phase_norm = col_phase.fillna("").astype(str).str.strip()
+
+            mask_phase = pd.Series([False] * len(src), index=src.index)
+            if selected_phases:
+                mask_phase = col_phase_norm.isin(selected_phases)
+
+            if include_unspecified:
+                mask_unspecified = (col_phase_norm.eq("") | col_phase_norm.str.lower().isin(["nan", "none", "null"]))
+                mask_phase = mask_phase | mask_unspecified
+
+            src = src.loc[mask_phase]
+
+            if src.empty:
+                st.warning("No items match the current Implementation Phase filter. Showing all items.")
+                src = df[df['Pursued'] == True] if show_only_pursued_catalog else df
+
+        st.caption(f"Catalog entries shown: {len(src):,}")
+        # Persist current catalog filters + filtered dataset for stakeholder PDF export
+        st.session_state['catalog_filtered_df'] = src.copy()
+        st.session_state['catalog_filter_state'] = {
+            'show_only_pursued': show_only_pursued_catalog,
+            'resp_filter': resp_filter,
+            'resp_filter_mode': resp_filter_mode,
+            'phase_filter': phase_filter,
+        }
 
         # Categories
         categories = pd.unique(src['Category'].dropna())
@@ -605,8 +990,10 @@ with tab_select:
             src = df
             categories = pd.unique(src['Category'].dropna())
 
-        selected_category = st.selectbox("Select a LEED v5 Category", categories, key="cat")
-
+        cat_options = list(categories)
+        prev_cat = st.session_state.get("cat", None)
+        cat_index = cat_options.index(prev_cat) if prev_cat in cat_options else 0
+        selected_category = st.selectbox("Select a LEED v5 Category", cat_options, index=cat_index, key="cat")
         # Credits (ID + Name for display)
         cred_src = src.loc[src['Category'].eq(selected_category), ['Credit_ID', 'Credit_Name']].dropna().drop_duplicates()
         if cred_src.empty and show_only_pursued_catalog:
@@ -614,9 +1001,13 @@ with tab_select:
             cred_src = df.loc[df['Category'].eq(selected_category), ['Credit_ID', 'Credit_Name']].dropna().drop_duplicates()
 
         cred_src['display'] = cred_src['Credit_ID'].astype(str) + " " + cred_src['Credit_Name']
+        credit_options = cred_src['display'].tolist()
+        prev_credit = st.session_state.get("credit_disp", None)
+        credit_index = credit_options.index(prev_credit) if prev_credit in credit_options else 0
         selected_credit_display = st.selectbox(
             f"Select a {selected_category} credit",
-            cred_src['display'],
+            credit_options,
+            index=credit_index,
             key="credit_disp"
         )
         selected_credit_row = cred_src.loc[cred_src['display'] == selected_credit_display].iloc[0]
@@ -639,7 +1030,10 @@ with tab_select:
                 'Option_Title'
             ].dropna().drop_duplicates()
 
-        selected_option = st.selectbox(f"Select a {selected_credit} option", opt_src, key="opt")
+        opt_options = opt_src.tolist() if hasattr(opt_src, "tolist") else list(opt_src)
+        prev_opt = st.session_state.get("opt", None)
+        opt_index = opt_options.index(prev_opt) if prev_opt in opt_options else 0
+        selected_option = st.selectbox(f"Select a {selected_credit} option", opt_options, index=opt_index, key="opt")
 
         # Paths
         path_src = src.loc[
@@ -659,7 +1053,10 @@ with tab_select:
                 'Path_Title'
             ].dropna().drop_duplicates()
 
-        selected_path = st.selectbox(f"Select a {selected_option} path", path_src, key="path")
+        path_options = path_src.tolist() if hasattr(path_src, "tolist") else list(path_src)
+        prev_path = st.session_state.get("path", None)
+        path_index = path_options.index(prev_path) if prev_path in path_options else 0
+        selected_path = st.selectbox(f"Select a {selected_option} path", path_options, index=path_index, key="path")
 
     # --- Final mask for this exact selection ---
     mask = (
@@ -778,14 +1175,18 @@ with tab_select:
     # =========================
     # Design Team Strategy + Approach + Status + Responsible + Effort
     # =========================
-    st.write("### Design Team Strategy:")
-    with st.expander("Approach", expanded=False):
+    st.markdown("---")
+    st.write("## Project's Strategy:")
+    st.write("### General Approach")
+    with st.expander("General Approach", expanded=True):
         key_base = f"{selected_category}|{selected_credit_id}|{selected_credit}|{selected_option}|{selected_path}"
         approach_key = f"approach::{key_base}"
         status_key = f"status::{key_base}"
         resp_key = f"responsible::{key_base}"
         effort_key = f"effort::{key_base}"
+        phase_key = f"phase::{key_base}"
 
+        st.caption("#### Input Werner Sobek")
         # ---- Approach (text) ----
         current_df_approach = ""
         _ser_appr = df.loc[mask, 'Approach'].dropna().astype(str)
@@ -843,22 +1244,12 @@ with tab_select:
         </style>
         """, unsafe_allow_html=True)
 
-        def parse_responsible(cell: str) -> list:
-            """Split a cell value into a list of valid stakeholders."""
-            if not cell or str(cell).strip().lower() in ("nan", "none"):
-                return []
-            parts = [p.strip() for chunk in str(cell).split(";") for p in chunk.split(",")]
-            seen, cleaned = set(), []
-            for p in parts:
-                if p in RESPONSIBLE_OPTIONS and p not in seen:
-                    cleaned.append(p)
-                    seen.add(p)
-            return cleaned
+        # Responsible parsing handled by parse_responsible_valid() helper
 
         current_df_resp = RESPONSIBLE_DEFAULTS.copy()
         _ser_resp = df.loc[mask, 'Responsible'].dropna().astype(str)
         if not _ser_resp.empty:
-            parsed = parse_responsible(_ser_resp.iloc[0])
+            parsed = parse_responsible_valid(_ser_resp.iloc[0])
             if parsed:
                 current_df_resp = parsed
 
@@ -902,6 +1293,109 @@ with tab_select:
             idx = st.session_state.df.loc[mask].index
             st.session_state.df.loc[idx, 'Effort'] = new_effort
             st.caption("Effort autosaved ✓")
+
+
+
+        # ---- Implementation Phase (dropdown) ----
+        current_df_phase = DEFAULT_IMPLEMENTATION_PHASE
+        _ser_phase = df.loc[mask, 'Implementation_Phase'].dropna().astype(str)
+        if not _ser_phase.empty and _ser_phase.iloc[0] in IMPLEMENTATION_PHASES:
+            current_df_phase = _ser_phase.iloc[0]
+
+        if phase_key not in st.session_state:
+            st.session_state[phase_key] = current_df_phase
+
+        new_phase = st.selectbox(
+            "Implementation Phase",
+            IMPLEMENTATION_PHASES,
+            index=IMPLEMENTATION_PHASES.index(st.session_state[phase_key]) if st.session_state[phase_key] in IMPLEMENTATION_PHASES else IMPLEMENTATION_PHASES.index(DEFAULT_IMPLEMENTATION_PHASE),
+            key=phase_key,
+            help="Planned phase of implementation across HOAI Leistungsphasen (LPH)."
+        )
+
+        if new_phase != current_df_phase:
+            idx = st.session_state.df.loc[mask].index
+            st.session_state.df.loc[idx, 'Implementation_Phase'] = new_phase
+            st.caption("Implementation Phase autosaved ✓")
+
+    # =========================
+    # Stakeholder-specific comments (per Responsible)
+    # =========================
+    st.write("### Stakeholder Approach")
+    with st.expander("Approach Stakeholder", expanded=True):
+        key_base = f"{selected_category}|{selected_credit_id}|{selected_credit}|{selected_option}|{selected_path}"
+        # Use the current Responsible selection (stored in session_state for the selected item)
+        assigned_stakeholders = st.session_state.get(f"responsible::{key_base}", [])
+        if not isinstance(assigned_stakeholders, list):
+            assigned_stakeholders = []
+
+        if not assigned_stakeholders:
+            st.info("No Responsible stakeholders are assigned to this credit/option/path. Add them under 'Approach' to enable stakeholder comments.")
+        else:
+            st.caption("#### Input Stakeholders")
+            for _stakeholder in assigned_stakeholders:
+                _col = comment_colname(_stakeholder)
+                if _col not in st.session_state.df.columns:
+                    st.session_state.df[_col] = np.nan
+
+                # Current comment from dataframe (first non-empty)
+                _current = ""
+                _ser = st.session_state.df.loc[mask, _col].dropna().astype(str)
+                if not _ser.empty:
+                    _current = _ser.iloc[0]
+
+                _k = f"comment::{key_base}::{_col}"
+                if _k not in st.session_state:
+                    st.session_state[_k] = _current
+
+                _new = st.text_area(
+                    f'Comments "{_stakeholder}"',
+                    key=_k,
+                    height=140,
+                    help=f"Input from {_stakeholder} regarding how to meet this credit/path during Design."
+                )
+
+                if _new != _current:
+                    _idx = st.session_state.df.loc[mask].index
+                    st.session_state.df.loc[_idx, _col] = _new
+                    st.caption(f'Comment "{_stakeholder}" autosaved ✓')
+
+
+    # =========================
+    # Stakeholder PDF export (respects Credit Library filters)
+    # =========================
+    st.markdown("---")
+    st.write("## Export")
+    _df_filtered = st.session_state.get("catalog_filtered_df", df).copy()
+    _filter_state = st.session_state.get("catalog_filter_state", {})
+    st.write("Export here a report PDF file for the filtered credits")
+    st.caption("Always make sure to regenerate report before export")
+    if st.button("Generate Filtered Credits Report", type="primary",use_container_width=True):
+        try:
+            _pdf_bytes = build_filtered_catalog_report_pdf(
+                df_filtered=_df_filtered,
+                project_name=st.session_state.get("project_name", "Project"),
+                rating_system=st.session_state.get("rating_system", ""),
+                color_map_=color_map,
+                filter_state=_filter_state
+            )
+            st.session_state["stakeholder_pdf_bytes"] = _pdf_bytes
+            # Simple filename
+            _resp = _filter_state.get("resp_filter", [])
+            _tag = "All" if not _resp else "_".join([re.sub(r'[^0-9A-Za-z]+','', r) for r in _resp])[:60]
+            st.session_state["stakeholder_pdf_name"] = f"LEED_v5_Stakeholder_Report_{_tag}.pdf"
+            st.success("Stakeholder PDF generated.")
+        except Exception as e:
+            st.error(f"PDF generation failed: {e}")
+
+    if st.session_state.get("stakeholder_pdf_bytes"):
+        st.download_button(
+            label="Download Filtered Credits Report",
+            data=st.session_state["stakeholder_pdf_bytes"],
+            file_name=st.session_state.get("stakeholder_pdf_name", "LEED_v5_Stakeholder_Report.pdf"),
+            mime="application/pdf",
+            use_container_width=True
+        )
 
     # Download updated Excel
     st.markdown("---")
@@ -1409,5 +1903,3 @@ with sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
-
-
