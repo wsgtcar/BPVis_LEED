@@ -916,7 +916,7 @@ with tab_select:
     # =========================
     with st.expander("Credits Library", expanded=True):
         # NEW: checkbox to filter to only pursued
-        st.caption("### Filter Credits")
+        st.caption("#### Filter Credits")
         show_only_pursued_catalog = st.checkbox(
             "Show only pursued credits/options/paths",
             value=False,
@@ -1052,7 +1052,7 @@ with tab_select:
         cat_options = list(categories)
         prev_cat = st.session_state.get("cat", None)
         cat_index = cat_options.index(prev_cat) if prev_cat in cat_options else 0
-        st.caption("### Select Credit")
+        st.caption("#### Select Credit")
         selected_category = st.selectbox("Select a LEED v5 Category", cat_options, index=cat_index, key="cat")
         # Credits (ID + Name for display)
         cred_src = src.loc[src['Category'].eq(selected_category), ['Credit_ID', 'Credit_Name']].dropna().drop_duplicates()
@@ -1983,6 +1983,7 @@ with sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
+
 
 
 
