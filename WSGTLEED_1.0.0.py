@@ -1678,7 +1678,7 @@ with tab_select:
             _resp = _filter_state.get("resp_filter", [])
             _tag = "All" if not _resp else "_".join([re.sub(r'[^0-9A-Za-z]+','', r) for r in _resp])[:60]
             st.session_state["stakeholder_pdf_name"] = f"LEED_v5_Stakeholder_Report_{_tag}.pdf"
-            st.success("Stakeholder PDF generated.")
+            st.success("Filtered PDF generated.")
         except Exception as e:
             st.error(f"PDF generation failed: {e}")
 
@@ -2197,4 +2197,5 @@ with sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
+
 
