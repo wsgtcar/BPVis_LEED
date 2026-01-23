@@ -1662,7 +1662,7 @@ with tab_select:
     st.write("## Export")
     _df_filtered = st.session_state.get("catalog_filtered_df", df).copy()
     _filter_state = st.session_state.get("catalog_filter_state", {})
-    st.write("Export here a report PDF file for the filtered credits")
+    st.write("Export here a full report PDF for filtered credits")
     st.caption("Always make sure to regenerate report before export")
     if st.button("Generate Filtered Credits Report", type="primary",use_container_width=True):
         try:
@@ -2197,5 +2197,6 @@ with sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
+
 
 
