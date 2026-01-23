@@ -63,6 +63,8 @@ RESPONSIBLE_DEFAULTS = ["Owner", "Sustainability Consultant", "Architect"]
 IMPLEMENTATION_PHASES = [f"LPH{i}" for i in range(1, 10)]
 DEFAULT_IMPLEMENTATION_PHASE = "LPH3"
 
+DEFAULT_BUILDING_PERMIT_RELEVANT = False
+
 
 # =======================
 # Helpers
@@ -321,6 +323,15 @@ def load_dataframe(xls_file):
         df['Effort'] = np.nan
 
 
+    # Building permit relevance (boolean)
+    if 'Building_Permit_Relevant' not in df.columns:
+        df['Building_Permit_Relevant'] = DEFAULT_BUILDING_PERMIT_RELEVANT
+    else:
+        df['Building_Permit_Relevant'] = df['Building_Permit_Relevant'].apply(
+            lambda x: str(x).strip().lower() in ('true','1','yes','y','x')
+        )
+
+
     # Implementation Phase
     if 'Implementation_Phase' not in df.columns:
         df['Implementation_Phase'] = DEFAULT_IMPLEMENTATION_PHASE
@@ -383,6 +394,13 @@ if uploaded_file is not None:
         st.session_state.available_points_credit = load_available_points_credit(uploaded_file)
 
 df = st.session_state.get('df', None)
+
+# Ensure new management columns exist even if session_state persists across reruns
+if df is not None:
+    if 'Building_Permit_Relevant' not in df.columns:
+        df['Building_Permit_Relevant'] = DEFAULT_BUILDING_PERMIT_RELEVANT
+    else:
+        df['Building_Permit_Relevant'] = df['Building_Permit_Relevant'].fillna(DEFAULT_BUILDING_PERMIT_RELEVANT).astype(bool)
 
 # Show project information inputs only after file is uploaded
 if df is not None:
@@ -688,6 +706,7 @@ def build_filtered_catalog_report_pdf(
     resp_filter = filter_state.get("resp_filter", []) or []
     resp_filter_mode = filter_state.get("resp_filter_mode", "Any")
     phase_filter = filter_state.get("phase_filter", []) or []
+    permit_filter = filter_state.get("permit_filter", []) or []
 
 
     buffer = io.BytesIO()
@@ -718,6 +737,11 @@ def build_filtered_catalog_report_pdf(
         filt_lines.append(f"<b>Implementation Phase filter:</b> {', '.join(phase_filter)}")
     else:
         filt_lines.append("<b>Implementation Phase filter:</b> (none)")
+
+    if permit_filter:
+        filt_lines.append(f"<b>Building permit relevant filter:</b> {', '.join(permit_filter)}")
+    else:
+        filt_lines.append("<b>Building permit relevant filter:</b> (none)")
 
     story.append(Paragraph("<br/>".join(filt_lines), small))
     story.append(Spacer(1, 6*mm))
@@ -794,6 +818,11 @@ def build_filtered_catalog_report_pdf(
                 impl_phase = _first(row_df.get('Implementation_Phase')) if 'Implementation_Phase' in row_df.columns else None
                 if impl_phase:
                     story.append(Paragraph(f"<b>Implementation Phase:</b> {_htmlize(str(impl_phase))}", small))
+
+                # Building permit relevance
+                if 'Building_Permit_Relevant' in row_df.columns:
+                    bpr = bool(row_df.get('Building_Permit_Relevant', pd.Series([False])).fillna(False).max())
+                    story.append(Paragraph(f"<b>Building permit relevant:</b> {'Yes' if bpr else 'No'}", small))
 
                 # Core fields
                 req = _first(row_df.get('Requirement'))
@@ -921,6 +950,16 @@ with tab_select:
             help="Show only credits/options/paths matching the selected Implementation Phase values."
         )
 
+        # NEW: filter catalog by Building permit relevance
+        permit_filter = st.multiselect(
+            "Filter catalog by Building permit relevant",
+            options=["Yes", "No"],
+            default=[],
+            key="catalog_permit_filter",
+            help="Show only credits/options/paths where 'Building permit relevant' matches your selection."
+        )
+
+
 
         # Base source df for the catalog depending on the filter
         src = df[df['Pursued'] == True] if show_only_pursued_catalog else df
@@ -973,6 +1012,24 @@ with tab_select:
                 st.warning("No items match the current Implementation Phase filter. Showing all items.")
                 src = df[df['Pursued'] == True] if show_only_pursued_catalog else df
 
+
+        # Apply Building permit relevance filter (if set)
+        if permit_filter:
+            _col_permit = src["Building_Permit_Relevant"] if "Building_Permit_Relevant" in src.columns else pd.Series([False] * len(src), index=src.index)
+            _col_permit = _col_permit.fillna(False).astype(bool)
+
+            _mask_permit = pd.Series([False] * len(src), index=src.index)
+            if "Yes" in permit_filter:
+                _mask_permit = _mask_permit | (_col_permit == True)
+            if "No" in permit_filter:
+                _mask_permit = _mask_permit | (_col_permit == False)
+
+            src = src.loc[_mask_permit]
+
+            if src.empty:
+                st.warning("No items match the current Building permit relevant filter. Showing all items.")
+                src = df[df['Pursued'] == True] if show_only_pursued_catalog else df
+
         st.caption(f"Catalog entries shown: {len(src):,}")
         # Persist current catalog filters + filtered dataset for stakeholder PDF export
         st.session_state['catalog_filtered_df'] = src.copy()
@@ -981,6 +1038,7 @@ with tab_select:
             'resp_filter': resp_filter,
             'resp_filter_mode': resp_filter_mode,
             'phase_filter': phase_filter,
+            'permit_filter': permit_filter,
         }
 
         # Categories
@@ -1185,6 +1243,7 @@ with tab_select:
         resp_key = f"responsible::{key_base}"
         effort_key = f"effort::{key_base}"
         phase_key = f"phase::{key_base}"
+        permit_key = f"permit::{key_base}"
 
         st.caption("#### Input Werner Sobek")
         # ---- Approach (text) ----
@@ -1317,6 +1376,25 @@ with tab_select:
             idx = st.session_state.df.loc[mask].index
             st.session_state.df.loc[idx, 'Implementation_Phase'] = new_phase
             st.caption("Implementation Phase autosaved ✓")
+
+
+        # ---- Building permit relevance (checkbox) ----
+        current_df_permit = bool(df.loc[mask, 'Building_Permit_Relevant'].fillna(DEFAULT_BUILDING_PERMIT_RELEVANT).max()) if 'Building_Permit_Relevant' in df.columns else DEFAULT_BUILDING_PERMIT_RELEVANT
+
+        if permit_key not in st.session_state:
+            st.session_state[permit_key] = current_df_permit
+
+        new_permit = st.checkbox(
+            "Building permit relevant",
+            value=bool(st.session_state[permit_key]),
+            key=permit_key,
+            help="Flag this credit/path as relevant for the building permit / approval process."
+        )
+
+        if bool(new_permit) != bool(current_df_permit):
+            idx = st.session_state.df.loc[mask].index
+            st.session_state.df.loc[idx, 'Building_Permit_Relevant'] = bool(new_permit)
+            st.caption("Building permit relevance autosaved ✓")
 
     # =========================
     # Stakeholder-specific comments (per Responsible)
@@ -1903,4 +1981,3 @@ with sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
-
