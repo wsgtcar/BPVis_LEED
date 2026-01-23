@@ -7,6 +7,7 @@ import streamlit.components.v1 as components
 import plotly.express as px
 import plotly.graph_objects as go
 import re
+import openpyxl
 from pathlib import Path
 
 from streamlit import sidebar
@@ -260,9 +261,127 @@ def load_available_points_credit(xls_file):
 
     return out
 
+# ---------- Credit_URL hyperlink extraction & normalization ----------
+def _normalize_url(val) -> str:
+    """Return a normalized URL (http/https) or empty string."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return ""
+    if re.match(r"^https?://", s, flags=re.IGNORECASE):
+        return s
+    if re.match(r"^www\.", s, flags=re.IGNORECASE):
+        return "https://" + s
+    return ""
+
+
+def _get_excel_bytes(xls_file):
+    """Get Excel bytes from a Streamlit UploadedFile, a file path, or a file-like object."""
+    try:
+        if hasattr(xls_file, "getvalue"):
+            return xls_file.getvalue()
+        if isinstance(xls_file, (str, Path)):
+            return Path(xls_file).read_bytes()
+        pos = xls_file.tell() if hasattr(xls_file, "tell") else None
+        if hasattr(xls_file, "seek"):
+            xls_file.seek(0)
+        data = xls_file.read()
+        if pos is not None and hasattr(xls_file, "seek"):
+            xls_file.seek(pos)
+        return data
+    except Exception:
+        return None
+
+
+def _extract_excel_hyperlinks_column(xls_file, sheet_name: str, column_name: str):
+    """Extract hyperlink targets (if present) for a given column; falls back to cell values."""
+    data = _get_excel_bytes(xls_file)
+    if not data:
+        return None
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+        if sheet_name not in wb.sheetnames:
+            return None
+        ws = wb[sheet_name]
+        headers = [c.value for c in ws[1]]
+        if column_name not in headers:
+            return None
+        col_idx = headers.index(column_name) + 1
+        out = []
+        for r in range(2, ws.max_row + 1):
+            cell = ws.cell(row=r, column=col_idx)
+            link = ""
+            if cell.hyperlink and getattr(cell.hyperlink, "target", None):
+                link = str(cell.hyperlink.target).strip()
+            val = "" if cell.value is None else str(cell.value).strip()
+            out.append(link if link else val)
+        return out
+    except Exception:
+        return None
+
+
+def _apply_credit_url_hyperlinks(df: pd.DataFrame, xls_file) -> pd.DataFrame:
+    """Ensure df['Credit_URL'] contains the actual hyperlink targets when Excel stores display text."""
+    if df is None:
+        return df
+    if "Credit_URL" not in df.columns:
+        df["Credit_URL"] = np.nan
+
+    extracted = _extract_excel_hyperlinks_column(xls_file, "LEED_V5_Requirements", "Credit_URL")
+    if extracted is None:
+        # normalize any existing URL-like values
+        df["Credit_URL"] = df["Credit_URL"].apply(_normalize_url)
+    else:
+        n = len(df)
+        extracted = (extracted[:n] + [""] * max(0, n - len(extracted)))[:n]
+        current = df["Credit_URL"].tolist()
+        merged = []
+        for cur, ext in zip(current, extracted):
+            cur_n = _normalize_url(cur)
+            ext_n = _normalize_url(ext)
+            merged.append(ext_n if ext_n else cur_n)
+        df["Credit_URL"] = merged
+
+    # empties -> NaN
+    df["Credit_URL"] = df["Credit_URL"].apply(lambda x: np.nan if not _normalize_url(x) else _normalize_url(x))
+
+    # propagate within each credit (credit-level field)
+    if all(c in df.columns for c in ["Category", "Credit_ID", "Credit_Name"]):
+        df["Credit_URL"] = df.groupby(["Category", "Credit_ID", "Credit_Name"], dropna=False)["Credit_URL"].transform(lambda s: s.ffill().bfill())
+
+    return df
+
+
+def get_best_credit_url(df: pd.DataFrame, selection_mask: pd.Series, category: str, credit_id: str, credit_name: str) -> str:
+    """Return best URL for a selection (row-level first, then credit-level)."""
+    if df is None or "Credit_URL" not in df.columns:
+        return ""
+    # selection-level
+    try:
+        s = df.loc[selection_mask, "Credit_URL"]
+        for v in s.dropna().astype(str).tolist():
+            u = _normalize_url(v)
+            if u:
+                return u
+    except Exception:
+        pass
+    # credit-level
+    try:
+        m = (df["Category"] == category) & (df["Credit_ID"] == credit_id) & (df["Credit_Name"] == credit_name)
+        s2 = df.loc[m, "Credit_URL"]
+        for v in s2.dropna().astype(str).tolist():
+            u = _normalize_url(v)
+            if u:
+                return u
+    except Exception:
+        pass
+    return ""
+
 # ---------- Load & keep DF in session_state ----------
 def load_dataframe(xls_file):
     df = pd.read_excel(xls_file, sheet_name="LEED_V5_Requirements")
+    df = _apply_credit_url_hyperlinks(df, xls_file)
 
     # Try loading project information (sheet 'Project_information') if present
     try:
@@ -718,7 +837,25 @@ def build_full_report_pdf(df: pd.DataFrame, project_name: str, rating_system: st
                     story.append(Paragraph(_htmlize(refs), small))
 
                 # Credit URL (printed in PDF export)
-                credit_url = _first(row_df.get('Credit_URL')) if 'Credit_URL' in row_df.columns else None
+                # Prefer row-level URL, fallback to credit-level URL within the loaded dataframe
+                credit_url = ""
+                if 'Credit_URL' in df.columns:
+                    try:
+                        if isinstance(row_df, pd.DataFrame) and 'Credit_URL' in row_df.columns:
+                            for _v in row_df['Credit_URL'].dropna().astype(str).tolist():
+                                _u = _normalize_url(_v)
+                                if _u:
+                                    credit_url = _u
+                                    break
+                        if not credit_url:
+                            _m_credit = (df['Category'] == category) & (df['Credit_ID'] == credit_id) & (df['Credit_Name'] == credit_name)
+                            for _v in df.loc[_m_credit, 'Credit_URL'].dropna().astype(str).tolist():
+                                _u = _normalize_url(_v)
+                                if _u:
+                                    credit_url = _u
+                                    break
+                    except Exception:
+                        credit_url = ""
                 if credit_url:
                     story.append(Paragraph("<b>Credit URL</b>", small))
                     _u = str(credit_url).strip()
@@ -1275,12 +1412,7 @@ with tab_select:
             st.markdown(_ref_html, unsafe_allow_html=True)
 
     # Credit URL (embedded preview)
-    credit_url = ""
-    if 'Credit_URL' in df.columns:
-        _url_series = df.loc[mask, 'Credit_URL'].dropna().drop_duplicates()
-        if not _url_series.empty:
-            credit_url = str(_url_series.iloc[0]).strip()
-
+    credit_url = get_best_credit_url(df, mask, selected_category, selected_credit_id, selected_credit)
     with st.expander("Credit URL", expanded=False):
         if credit_url:
             st.caption("Embedded source page for this credit/path. Some sites block embedding; use the button to open in a new tab if needed.")
