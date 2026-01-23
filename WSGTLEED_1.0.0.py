@@ -591,6 +591,19 @@ def _htmlize(text: str) -> str:
     s = s.replace("\n", "<br/>")
     return s
 
+
+def _escape_attr(val: str) -> str:
+    """Escape a string for use in ReportLab Paragraph attribute values (e.g., href)."""
+    if val is None:
+        return ""
+    s = str(val)
+    # Important: escape & first
+    s = s.replace("&", "&amp;")
+    s = s.replace('"', "&quot;")
+    s = s.replace("'", "&#39;")
+    s = s.replace("<", "&lt;").replace(">", "&gt;")
+    return s
+
 def _compute_dashboard_data(df_: pd.DataFrame):
     """Reproduce the same aggregation used in the dashboard (Planned points by Category, etc.)."""
     pursued = df_[df_['Pursued'] == True].copy()
@@ -1016,6 +1029,7 @@ def build_filtered_catalog_report_pdf(
                     refs = _first(row_df.get('Referenced_Standards'))
                 elif 'Referenced Standards' in row_df.columns:
                     refs = _first(row_df.get('Referenced Standards'))
+                credit_url = _first(row_df.get('Credit_URL')) if 'Credit_URL' in row_df.columns else None
 
                 max_pts_eff = row_df.get('Max_Points_Effective', pd.Series(dtype=float)).dropna()
                 planned_pts = int(pd.to_numeric(row_df.get('Planned_Points', 0), errors='coerce').fillna(0).max())
@@ -1076,6 +1090,14 @@ def build_filtered_catalog_report_pdf(
                 if refs:
                     story.append(Paragraph("<b>Referenced Standards</b>", small))
                     story.append(Paragraph(_htmlize(refs), small))
+
+                # Credit URL (clickable)
+                if credit_url:
+                    _u = str(credit_url).strip()
+                    if _u and _u.lower() not in ("nan", "none", "null"):
+                        story.append(Paragraph("<b>Credit URL</b>", small))
+                        # Render a clickable hyperlink in PDF (viewer-dependent)
+                        story.append(Paragraph(f'<link href="{_escape_attr(_u)}">{_htmlize(_u)}</link>', small))
 
                 story.append(Spacer(1, 4*mm))
 
