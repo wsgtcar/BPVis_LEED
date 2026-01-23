@@ -3,6 +3,7 @@ import math
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.express as px
 import plotly.graph_objects as go
 import re
@@ -294,7 +295,7 @@ def load_dataframe(xls_file):
         'Requirement',
         'Thresholds', 'Tresholds', 'And', 'Or',
         'Documentation', 'Referenced_Standards', 'Referenced Standards',
-        'Approach', 'Status', 'Responsible', 'Effort', 'Implementation_Phase'
+        'Approach', 'Status', 'Responsible', 'Effort', 'Implementation_Phase', 'Credit_URL'
     ]
     for c in text_cols:
         if c in df.columns:
@@ -321,6 +322,10 @@ def load_dataframe(xls_file):
         df['Responsible'] = np.nan
     if 'Effort' not in df.columns:
         df['Effort'] = np.nan
+
+
+    if 'Credit_URL' not in df.columns:
+        df['Credit_URL'] = np.nan
 
 
     # Building permit relevance (boolean)
@@ -397,10 +402,40 @@ df = st.session_state.get('df', None)
 
 # Ensure new management columns exist even if session_state persists across reruns
 if df is not None:
+    # Credit_URL (text)
+    if 'Credit_URL' not in df.columns:
+        df['Credit_URL'] = np.nan
+    else:
+        _na = df['Credit_URL'].isna()
+        df['Credit_URL'] = (
+            df['Credit_URL'].astype(str)
+            .str.replace('\u00A0', ' ', regex=False)
+            .str.strip()
+        )
+        df.loc[_na, 'Credit_URL'] = np.nan
+
+    # Implementation Phase (text, default LPH3)
+    if 'Implementation_Phase' not in df.columns:
+        df['Implementation_Phase'] = DEFAULT_IMPLEMENTATION_PHASE
+    df['Implementation_Phase'] = df['Implementation_Phase'].fillna('').astype(str).str.strip()
+    _mask_blank_phase = (df['Implementation_Phase'].eq('') | df['Implementation_Phase'].str.lower().isin(['nan','none','null']))
+    df.loc[_mask_blank_phase, 'Implementation_Phase'] = DEFAULT_IMPLEMENTATION_PHASE
+    df.loc[~df['Implementation_Phase'].isin(IMPLEMENTATION_PHASES), 'Implementation_Phase'] = DEFAULT_IMPLEMENTATION_PHASE
+
+    # Building permit relevance (boolean)
     if 'Building_Permit_Relevant' not in df.columns:
         df['Building_Permit_Relevant'] = DEFAULT_BUILDING_PERMIT_RELEVANT
     else:
-        df['Building_Permit_Relevant'] = df['Building_Permit_Relevant'].fillna(DEFAULT_BUILDING_PERMIT_RELEVANT).astype(bool)
+        # tolerate a mix of bools/strings
+        df['Building_Permit_Relevant'] = df['Building_Permit_Relevant'].apply(
+            lambda x: bool(x) if isinstance(x, (bool, np.bool_)) else str(x).strip().lower() in ('true','1','yes','y','x')
+        )
+
+    # Stakeholder comment columns (in case an older session_state.df is loaded)
+    for _stakeholder in RESPONSIBLE_OPTIONS:
+        _col = comment_colname(_stakeholder)
+        if _col not in df.columns:
+            df[_col] = np.nan
 
 # Show project information inputs only after file is uploaded
 if df is not None:
@@ -916,7 +951,6 @@ with tab_select:
     # =========================
     with st.expander("Credits Library", expanded=True):
         # NEW: checkbox to filter to only pursued
-        st.caption("#### Filter Credits")
         show_only_pursued_catalog = st.checkbox(
             "Show only pursued credits/options/paths",
             value=False,
@@ -1052,7 +1086,6 @@ with tab_select:
         cat_options = list(categories)
         prev_cat = st.session_state.get("cat", None)
         cat_index = cat_options.index(prev_cat) if prev_cat in cat_options else 0
-        st.caption("#### Select Credit")
         selected_category = st.selectbox("Select a LEED v5 Category", cat_options, index=cat_index, key="cat")
         # Credits (ID + Name for display)
         cred_src = src.loc[src['Category'].eq(selected_category), ['Credit_ID', 'Credit_Name']].dropna().drop_duplicates()
@@ -1231,6 +1264,24 @@ with tab_select:
             st.write("### Referenced Standards:")
             _ref_html = str(_ref_series.iloc[0]).replace("\r\n", "<br>").replace("\n", "<br>")
             st.markdown(_ref_html, unsafe_allow_html=True)
+
+    # Credit URL (embedded preview)
+    credit_url = ""
+    if 'Credit_URL' in df.columns:
+        _url_series = df.loc[mask, 'Credit_URL'].dropna().drop_duplicates()
+        if not _url_series.empty:
+            credit_url = str(_url_series.iloc[0]).strip()
+
+    with st.expander("Credit URL", expanded=False):
+        if credit_url:
+            st.caption("Embedded source page for this credit/path. Some sites block embedding; use the button to open in a new tab if needed.")
+            st.link_button("Open in new tab", credit_url)
+            try:
+                components.iframe(credit_url, height=720, scrolling=True)
+            except Exception as e:
+                st.warning(f"Could not embed this URL. Open it in a new tab instead. Details: {e}")
+        else:
+            st.info("No Credit_URL is provided for this selection in the Excel file.")
 
     # =========================
     # Design Team Strategy + Approach + Status + Responsible + Effort
@@ -1983,7 +2034,3 @@ with sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
-
-
-
-
