@@ -717,6 +717,15 @@ def build_full_report_pdf(df: pd.DataFrame, project_name: str, rating_system: st
                     story.append(Paragraph("<b>Referenced Standards</b>", small))
                     story.append(Paragraph(_htmlize(refs), small))
 
+                # Credit URL (printed in PDF export)
+                credit_url = _first(row_df.get('Credit_URL')) if 'Credit_URL' in row_df.columns else None
+                if credit_url:
+                    story.append(Paragraph("<b>Credit URL</b>", small))
+                    _u = str(credit_url).strip()
+                    if _u:
+                        # Make it clickable if supported by the PDF viewer
+                        story.append(Paragraph(f'<link href="{_htmlize(_u)}">{_htmlize(_u)}</link>', small))
+
                 story.append(Spacer(1, 4*mm))
             story.append(Spacer(1, 6*mm))
 
