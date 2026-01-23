@@ -1435,7 +1435,7 @@ with tab_select:
 
     # Credit URL (embedded preview)
     credit_url = get_best_credit_url(df, mask, selected_category, selected_credit_id, selected_credit)
-    with st.expander("Credit URL", expanded=False):
+    with st.expander("See Complete Credit's Requirement", expanded=False):
         if credit_url:
             st.caption("Embedded source page for this credit/path. Some sites block embedding; use the button to open in a new tab if needed.")
             st.link_button("Open in new tab", credit_url)
@@ -2197,3 +2197,4 @@ with sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
+
