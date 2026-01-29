@@ -126,12 +126,47 @@ def comment_colname(stakeholder: str) -> str:
     safe = re.sub(r'[^0-9A-Za-z]+', '_', str(stakeholder)).strip('_')
     return f"Comments_{safe}"
 
+
+# =======================
+# Text cleaning (preserve formatting)
+# =======================
+def clean_singleline_text_series(s: pd.Series) -> pd.Series:
+    """
+    Normalize single-line text (IDs, labels) without preserving intra-cell whitespace.
+    Collapses repeated whitespace to one space and strips ends.
+    """
+    return (
+        s.astype(str)
+         .str.replace("\u00A0", " ", regex=False)  # NBSP
+         .str.replace(r"\s+", " ", regex=True)
+         .str.strip()
+    )
+
+
+def clean_multiline_text_series(s: pd.Series) -> pd.Series:
+    """
+    Normalize multiline text while preserving paragraph/line-break structure.
+    - Keeps '\n' line breaks
+    - Removes NBSP
+    - Normalizes Windows/Mac line endings to '\n'
+    - Removes trailing spaces at end of lines
+    """
+    s2 = (
+        s.astype(str)
+         .str.replace("\u00A0", " ", regex=False)
+         .str.replace("\r\n", "\n", regex=False)
+         .str.replace("\r", "\n", regex=False)
+    )
+    # remove trailing spaces/tabs before a newline (preserve blank lines)
+    s2 = s2.str.replace(r"[\t ]+\n", "\n", regex=True)
+    return s2
+
 # =========================
 # Sidebar — template download & file upload
 # =========================
 st.sidebar.image("Pamo_Icon_Black.png", width=80)
 st.sidebar.write("## BPVis LEED V5 Precheck")
-st.sidebar.write("Version 1.0.0")
+st.sidebar.write("Version 1.0.1")
 
 st.sidebar.markdown("### Download Template")
 template_path = Path("templates/LEED v5 BD+C Requirements.xlsx")
@@ -408,27 +443,34 @@ def load_dataframe(xls_file):
         pass
 
     # Clean up text columns (preserve NaNs!)
-    text_cols = [
+    # IMPORTANT: preserve formatting for multiline fields (line breaks and paragraph spacing).
+    singleline_cols = [
         'Category', 'Credit_ID', 'Credit_Name',
         'Option_Title', 'Path_Title',
+        'Status', 'Responsible', 'Effort',
+        'Implementation_Phase', 'Credit_URL'
+    ]
+    multiline_cols = [
         'Requirement',
         'Thresholds', 'Tresholds', 'And', 'Or',
         'Documentation', 'Referenced_Standards', 'Referenced Standards',
-        'Approach', 'Status', 'Responsible', 'Effort', 'Implementation_Phase', 'Credit_URL'
+        'Approach'
     ]
-    for c in text_cols:
+
+    for c in singleline_cols:
         if c in df.columns:
             na_mask = df[c].isna()
-            cleaned = (
-                df[c].astype(str)
-                .str.replace('\u00A0', ' ', regex=False)
-                .str.replace(r'\s+', ' ', regex=True)
-                .str.strip()
-            )
-            df[c] = cleaned
+            df[c] = clean_singleline_text_series(df[c])
+            df.loc[na_mask, c] = np.nan  # restore NaNs
+
+    for c in multiline_cols:
+        if c in df.columns:
+            na_mask = df[c].isna()
+            df[c] = clean_multiline_text_series(df[c])
             df.loc[na_mask, c] = np.nan  # restore NaNs
 
     # Normalize legacy "Tresholds"
+
     if 'Thresholds' not in df.columns and 'Tresholds' in df.columns:
         df['Thresholds'] = df['Tresholds']
 
@@ -471,19 +513,14 @@ def load_dataframe(xls_file):
         if _col not in df.columns:
             df[_col] = np.nan
 
-    # Clean comment columns (preserve NaNs)
+    # Clean comment columns (preserve NaNs and multiline formatting)
     for _col in [comment_colname(s) for s in RESPONSIBLE_OPTIONS if comment_colname(s) in df.columns]:
         _na = df[_col].isna()
-        _cleaned = (
-            df[_col].astype(str)
-            .str.replace('\u00A0', ' ', regex=False)
-            .str.replace(r'\s+', ' ', regex=True)
-            .str.strip()
-        )
-        df[_col] = _cleaned
+        df[_col] = clean_multiline_text_series(df[_col])
         df.loc[_na, _col] = np.nan
 
     # Numeric
+
     if 'Max_Points' in df.columns:
         df['Max_Points'] = pd.to_numeric(df['Max_Points'], errors='coerce')
 
@@ -1714,6 +1751,30 @@ with tab_select:
         if ap_credit_to_save is not None and not ap_credit_to_save.empty:
             ap_credit_to_save.to_excel(writer, sheet_name="Available_Points_Credit", index=False)
 
+        # Preserve line breaks / paragraphs in Excel for multiline fields (Approach, comments, requirements, etc.)
+        try:
+            from openpyxl.styles import Alignment
+            ws_req = writer.sheets.get("LEED_V5_Requirements")
+            if ws_req is not None:
+                wrap = Alignment(wrap_text=True, vertical="top")
+                wrap_cols = {
+                    "Requirement", "Thresholds", "Tresholds", "And", "Or",
+                    "Documentation", "Referenced_Standards", "Referenced Standards",
+                    "Approach"
+                }
+                wrap_cols.update([comment_colname(s) for s in RESPONSIBLE_OPTIONS])
+
+                header = [cell.value for cell in ws_req[1]]
+                for col_idx, col_name in enumerate(header, start=1):
+                    if col_name in wrap_cols:
+                        for row in ws_req.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
+                            for cell in row:
+                                if cell.value is not None and str(cell.value).strip() != "":
+                                    cell.alignment = wrap
+        except Exception:
+            pass
+
+
     st.sidebar.markdown("---")
     st.sidebar.download_button(
         label="Save Project",
@@ -2197,6 +2258,3 @@ with sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
-
-
-
