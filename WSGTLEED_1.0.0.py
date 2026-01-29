@@ -495,7 +495,7 @@ def _restore_embedded_images_into_df(df_: pd.DataFrame, xls_file) -> pd.DataFram
 # =========================
 st.sidebar.image("Pamo_Icon_Black.png", width=80)
 st.sidebar.write("## BPVis LEED V5 Precheck")
-st.sidebar.write("Version 1.1.3")
+st.sidebar.write("Version 1.1.0")
 
 st.sidebar.markdown("### Download Template")
 template_path = Path("templates/LEED v5 BD+C Requirements.xlsx")
@@ -2862,3 +2862,4 @@ with sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
+
