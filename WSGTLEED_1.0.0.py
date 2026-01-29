@@ -8,6 +8,28 @@ import plotly.express as px
 import plotly.graph_objects as go
 import re
 import openpyxl
+import base64
+import uuid
+import hashlib
+from typing import Dict, List, Tuple, Optional
+
+
+# Rich-text editor (Quill) and HTML parsing for PDF export
+try:
+    from streamlit_quill import st_quill  # works with streamlit-quill / streamlit-quill2
+    _QUILL_AVAILABLE = True
+except Exception:
+    st_quill = None
+    _QUILL_AVAILABLE = False
+
+try:
+    from bs4 import BeautifulSoup, NavigableString, Tag
+    _BS4_AVAILABLE = True
+except Exception:
+    BeautifulSoup = None
+    NavigableString = None
+    Tag = None
+    _BS4_AVAILABLE = False
 from pathlib import Path
 
 from streamlit import sidebar
@@ -66,6 +88,15 @@ IMPLEMENTATION_PHASES = [f"LPH{i}" for i in range(1, 10)]
 DEFAULT_IMPLEMENTATION_PHASE = "LPH3"
 
 DEFAULT_BUILDING_PERMIT_RELEVANT = False
+
+# =======================
+# Embedded images in rich-text fields (Excel-safe persistence)
+# =======================
+EMBEDDED_IMAGES_SHEET = "Embedded_Images"
+ASSET_SCHEME = "wsasset://"
+# Excel cell text limit is 32,767 chars; keep chunks well below that.
+ASSET_B64_CHUNK_SIZE = 20000
+
 
 
 # =======================
@@ -161,12 +192,310 @@ def clean_multiline_text_series(s: pd.Series) -> pd.Series:
     s2 = s2.str.replace(r"[\t ]+\n", "\n", regex=True)
     return s2
 
+
+
+# =======================
+# Rich-text helpers (Quill HTML / Markdown display)
+# =======================
+
+def _looks_like_html(value: str) -> bool:
+    """Heuristic: treat text as HTML if it contains common tags."""
+    if value is None:
+        return False
+    s = str(value)
+    return bool(re.search(r"<(p|div|span|strong|b|em|i|ul|ol|li|br|a)\b", s, flags=re.I))
+
+
+def _ensure_quill_html(value: str) -> str:
+    """Ensure a value is suitable as Quill initial HTML.
+
+    - If the value already looks like HTML, return it unchanged.
+    - Otherwise, convert plain text into basic <p>...</p> paragraphs, preserving line breaks.
+    """
+    if value is None:
+        return ""
+    t = str(value).strip()
+    if not t or t.lower() in ("nan", "none", "null"):
+        return ""
+    if _looks_like_html(t):
+        return t
+
+    # Plain text -> basic HTML paragraphs
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    esc = (
+        t.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+    )
+
+    # blank line = new paragraph
+    parts = re.split(r"\n\s*\n", esc)
+    paras: list[str] = []
+    for part in parts:
+        part = part.strip("\n")
+        if not part.strip():
+            continue
+        part = part.replace("\n", "<br/>")
+        paras.append(f"<p>{part}</p>")
+    return "".join(paras) if paras else ""
+
+
+def _normalize_quill_html(value: str) -> str:
+    """Normalize Quill output so we can compare / store cleanly."""
+    if value is None:
+        return ""
+    t = str(value).strip()
+    if not t or t.lower() in ("nan", "none", "null"):
+        return ""
+    # Quill's common 'empty' payload
+    if re.fullmatch(r"(?is)\s*<p>\s*(<br\s*/?>)?\s*</p>\s*", t):
+        return ""
+    # remove purely empty paragraphs
+    t = re.sub(r"(?is)<p>\s*(<br\s*/?>)?\s*</p>", "", t)
+    return t.strip()
+
+
+def render_rich_readonly(value: str) -> None:
+    """Display content that may be HTML (Quill) or Markdown/plain text.
+
+    - HTML: rendered as HTML.
+    - Non-HTML: rendered as Markdown, preserving line breaks.
+    """
+    if value is None:
+        return
+    t = str(value)
+    if not t.strip() or t.strip().lower() in ("nan", "none", "null"):
+        return
+
+    if _looks_like_html(t):
+        st.markdown(t, unsafe_allow_html=True)
+    else:
+        # Preserve manual line breaks in Markdown
+        t = t.replace("\r\n", "\n").replace("\r", "\n")
+        t = t.replace("\n", "  \n")
+        st.markdown(t, unsafe_allow_html=True)
+
+
+# =======================
+# Embedded images persistence (Quill <img> tags) across Excel save/load
+# =======================
+
+# Finds <img ... src="data:image/...;base64,....">
+_DATA_URI_IMG_RE = re.compile(
+    r'(<img\b[^>]*\bsrc=)(?P<q>["\'])(?P<uri>data:image/[^"\']+?;base64,[^"\']+?)(?P=q)',
+    flags=re.IGNORECASE
+)
+
+# Finds wsasset://<asset_id>
+_ASSET_REF_RE = re.compile(re.escape(ASSET_SCHEME) + r'([0-9A-Za-z\-]{6,64})')
+
+
+def _extract_data_uri_images_from_html(html: str,
+                                      seen_uri_to_id: Dict[str, str],
+                                      assets_by_id: Dict[str, Tuple[str, str]]) -> str:
+    """Replace data-uri images in <img src="data:image/...;base64,..."> with ASSET_SCHEME refs.
+
+    Returns modified HTML. Discovered images are added to assets_by_id as:
+      assets_by_id[asset_id] = (mime, base64_payload)
+
+    Note: Excel cells are limited to 32,767 characters, so data-uri images must NOT be stored directly
+    in a single cell.
+    """
+    if html is None:
+        return ""
+    s = str(html)
+    if "data:image" not in s or "<img" not in s.lower():
+        return s
+
+    def _make_id(b64_payload: str) -> str:
+        # Deterministic short id (hash) to deduplicate identical images across fields/rows
+        return hashlib.sha1(b64_payload.encode("utf-8")).hexdigest()[:12]
+
+    def repl(m: re.Match) -> str:
+        uri = m.group("uri")
+        q = m.group("q")
+
+        # Deduplicate by full URI string
+        if uri in seen_uri_to_id:
+            asset_id = seen_uri_to_id[uri]
+            return f"{m.group(1)}{q}{ASSET_SCHEME}{asset_id}{q}"
+
+        # Parse mime + base64 payload
+        try:
+            prefix, b64_payload = uri.split(",", 1)
+            mime = prefix.split(";", 1)[0].split(":", 1)[1]
+        except Exception:
+            return m.group(0)
+
+        asset_id = _make_id(b64_payload)
+        # Collision safety: if id already used for different payload, fall back to UUID
+        if asset_id in assets_by_id and assets_by_id[asset_id][1] != b64_payload:
+            asset_id = str(uuid.uuid4())
+
+        seen_uri_to_id[uri] = asset_id
+        assets_by_id[asset_id] = (mime, b64_payload)
+        return f"{m.group(1)}{q}{ASSET_SCHEME}{asset_id}{q}"
+
+    return _DATA_URI_IMG_RE.sub(repl, s)
+
+
+def _rich_columns_for_assets(df_: pd.DataFrame) -> List[str]:
+    """Columns that may contain Quill HTML (and therefore <img> tags)."""
+    base = [
+        "Approach",
+        "Requirement",
+        "Thresholds", "Tresholds",
+        "And", "Or",
+        "Documentation",
+        "Referenced_Standards", "Referenced Standards",
+    ]
+    cols = [c for c in base if c in df_.columns]
+    # Stakeholder comment columns
+    cols.extend([c for c in df_.columns if str(c).startswith("Comments_")])
+
+    # De-dup while preserving order
+    seen = set()
+    out: List[str] = []
+    for c in cols:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+
+def _prepare_df_for_excel_with_assets(df_: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (df_for_excel, assets_sheet_df).
+
+    df_for_excel has data-uri images replaced by ASSET_SCHEME refs.
+    assets_sheet_df stores the base64 payloads in chunked rows to stay under Excel cell limits.
+    """
+    if df_ is None or df_.empty:
+        return df_, pd.DataFrame(columns=["Asset_ID", "Mime", "Chunk_Index", "Chunk_Base64"])
+
+    df_out = df_.copy()
+    seen_uri_to_id: Dict[str, str] = {}
+    assets_by_id: Dict[str, Tuple[str, str]] = {}
+
+    cols = _rich_columns_for_assets(df_out)
+    for col in cols:
+        if col not in df_out.columns:
+            continue
+        new_vals = []
+        for v in df_out[col].tolist():
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                new_vals.append(v)
+                continue
+            sv = str(v)
+            # only scan if likely contains data-uri images
+            if "data:image" in sv and "<img" in sv.lower():
+                new_vals.append(_extract_data_uri_images_from_html(sv, seen_uri_to_id, assets_by_id))
+            else:
+                new_vals.append(v)
+        df_out[col] = new_vals
+
+    # Build assets sheet (chunked base64)
+    rows = []
+    for asset_id, (mime, b64_payload) in assets_by_id.items():
+        if not b64_payload:
+            continue
+        for i in range(0, len(b64_payload), ASSET_B64_CHUNK_SIZE):
+            chunk = b64_payload[i:i + ASSET_B64_CHUNK_SIZE]
+            rows.append({
+                "Asset_ID": asset_id,
+                "Mime": mime,
+                "Chunk_Index": int(i / ASSET_B64_CHUNK_SIZE),
+                "Chunk_Base64": chunk
+            })
+
+    assets_df = pd.DataFrame(rows, columns=["Asset_ID", "Mime", "Chunk_Index", "Chunk_Base64"])
+    return df_out, assets_df
+
+
+def _read_embedded_images_map(xls_file) -> Dict[str, str]:
+    """Read Embedded_Images sheet (if present) and return {asset_id: data_uri}."""
+    data = _get_excel_bytes(xls_file)
+    if not data:
+        return {}
+    try:
+        img_df = pd.read_excel(io.BytesIO(data), sheet_name=EMBEDDED_IMAGES_SHEET, dtype=str)
+    except Exception:
+        return {}
+
+    if img_df is None or img_df.empty:
+        return {}
+
+    # Normalize column names
+    cols = {str(c).strip().lower(): c for c in img_df.columns}
+    needed = ["asset_id", "mime", "chunk_index", "chunk_base64"]
+    if not all(k in cols for k in needed):
+        return {}
+
+    a = cols["asset_id"]
+    m = cols["mime"]
+    ci = cols["chunk_index"]
+    cb = cols["chunk_base64"]
+
+    img_df = img_df[[a, m, ci, cb]].copy()
+    img_df.columns = ["Asset_ID", "Mime", "Chunk_Index", "Chunk_Base64"]
+    img_df["Chunk_Index"] = pd.to_numeric(img_df["Chunk_Index"], errors="coerce").fillna(0).astype(int)
+
+    out: Dict[str, str] = {}
+    for asset_id, sub in img_df.groupby("Asset_ID", dropna=False):
+        if asset_id is None or str(asset_id).strip() == "" or str(asset_id).lower() == "nan":
+            continue
+        sub = sub.sort_values("Chunk_Index")
+        b64_payload = "".join([str(x) for x in sub["Chunk_Base64"].fillna("").tolist()])
+        try:
+            mime = str(sub["Mime"].dropna().iloc[0]).strip()
+        except Exception:
+            mime = "image/png"
+        if not mime:
+            mime = "image/png"
+        if b64_payload:
+            out[str(asset_id).strip()] = f"data:{mime};base64,{b64_payload}"
+    return out
+
+
+def _restore_assets_in_text(value: str, asset_map: Dict[str, str]) -> str:
+    """Replace ASSET_SCHEME refs with data-uris using asset_map."""
+    if value is None:
+        return ""
+    s = str(value)
+    if ASSET_SCHEME not in s:
+        return s
+
+    def repl(m: re.Match) -> str:
+        asset_id = m.group(1)
+        return asset_map.get(asset_id, m.group(0))
+
+    return _ASSET_REF_RE.sub(repl, s)
+
+
+def _restore_embedded_images_into_df(df_: pd.DataFrame, xls_file) -> pd.DataFrame:
+    """If the workbook contains Embedded_Images, restore <img src="wsasset://..."> into data-uris."""
+    if df_ is None or df_.empty:
+        return df_
+    asset_map = _read_embedded_images_map(xls_file)
+    if not asset_map:
+        return df_
+
+    df_out = df_.copy()
+    cols = _rich_columns_for_assets(df_out)
+    for col in cols:
+        if col not in df_out.columns:
+            continue
+        na = df_out[col].isna()
+        df_out[col] = df_out[col].astype(str).apply(lambda x: _restore_assets_in_text(x, asset_map))
+        df_out.loc[na, col] = np.nan
+    return df_out
+
+
 # =========================
 # Sidebar — template download & file upload
 # =========================
 st.sidebar.image("Pamo_Icon_Black.png", width=80)
 st.sidebar.write("## BPVis LEED V5 Precheck")
-st.sidebar.write("Version 1.0.1")
+st.sidebar.write("Version 1.1.3")
 
 st.sidebar.markdown("### Download Template")
 template_path = Path("templates/LEED v5 BD+C Requirements.xlsx")
@@ -417,6 +746,8 @@ def get_best_credit_url(df: pd.DataFrame, selection_mask: pd.Series, category: s
 def load_dataframe(xls_file):
     df = pd.read_excel(xls_file, sheet_name="LEED_V5_Requirements")
     df = _apply_credit_url_hyperlinks(df, xls_file)
+    # Restore embedded images (if the workbook contains the assets sheet)
+    df = _restore_embedded_images_into_df(df, xls_file)
 
     # Try loading project information (sheet 'Project_information') if present
     try:
@@ -615,18 +946,247 @@ if df is None:
     st.stop()
 
 # ==== PDF / REPORT HELPERS ====================================================
+
+def _escape_text_for_para(s: str) -> str:
+    """Escape text nodes for ReportLab Paragraph markup."""
+    if s is None:
+        return ""
+    t = str(s)
+    # Normalize NBSP (can appear as unicode or &nbsp;)
+    t = t.replace(" ", " ").replace("&nbsp;", " ")
+    # Escape XML-like entities for ReportLab text nodes
+    t = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return t
+
+
+def _markdown_to_reportlab(s: str) -> str:
+    """Very small Markdown subset for PDF: **bold**, line breaks."""
+    if s is None:
+        return ""
+    t = str(s).replace("\r\n", "\n").replace("\r", "\n")
+    t = _escape_text_for_para(t)
+
+    # Bold: **text**
+    t = re.sub(r"\*\*(.+?)\*\*", lambda m: f"<b>{m.group(1)}</b>", t)
+
+    # Convert newlines to <br/>
+    t = t.replace("\n", "<br/>")
+    return t
+
+
+def _html_to_reportlab(html: str) -> str:
+    """Convert basic HTML (Quill output) to ReportLab Paragraph markup.
+
+    Supported conversions:
+    - <strong>/<b> -> <b>
+    - <em>/<i> -> <i>
+    - <u> -> <u>
+    - <br> -> <br/>
+    - <p>/<div> -> paragraph spacing
+    - <ul>/<ol>/<li> -> bullet lines
+    - <a href> -> <link href="...">text</link>
+    """
+    if not html:
+        return ""
+    h = str(html)
+    h = h.replace(" ", " ").replace("&nbsp;", " ")
+
+    # Fast path: if bs4 is not available, do a conservative regex-based conversion
+    if not _BS4_AVAILABLE:
+        h2 = h
+        h2 = re.sub(r"(?is)<\s*strong[^>]*>", "<b>", h2)
+        h2 = re.sub(r"(?is)<\s*/\s*strong\s*>", "</b>", h2)
+        h2 = re.sub(r"(?is)<\s*b[^>]*>", "<b>", h2)
+        h2 = re.sub(r"(?is)<\s*/\s*b\s*>", "</b>", h2)
+        h2 = re.sub(r"(?is)<\s*em[^>]*>", "<i>", h2)
+        h2 = re.sub(r"(?is)<\s*/\s*em\s*>", "</i>", h2)
+        h2 = re.sub(r"(?is)<\s*i[^>]*>", "<i>", h2)
+        h2 = re.sub(r"(?is)<\s*/\s*i\s*>", "</i>", h2)
+        h2 = re.sub(r"(?is)<\s*u[^>]*>", "<u>", h2)
+        h2 = re.sub(r"(?is)<\s*/\s*u\s*>", "</u>", h2)
+        h2 = re.sub(r"(?is)<\s*br\s*/?\s*>", "<br/>", h2)
+        # paragraphs -> spacing
+        h2 = re.sub(r"(?is)<\s*/\s*p\s*>", "<br/><br/>", h2)
+        h2 = re.sub(r"(?is)<\s*p[^>]*>", "", h2)
+        h2 = re.sub(r"(?is)<\s*/\s*div\s*>", "<br/><br/>", h2)
+        h2 = re.sub(r"(?is)<\s*div[^>]*>", "", h2)
+        # Strip remaining tags conservatively (keep b,i,u,br,link)
+        h2 = re.sub(r"(?is)<(?!/?(b|i|u|br|link))[^>]+>", "", h2)
+        # Escape stray & (avoid double-escaping existing entities)
+        h2 = h2.replace("&", "&amp;")
+        h2 = h2.replace("&amp;lt;", "&lt;").replace("&amp;gt;", "&gt;")
+        return h2.strip()
+
+    soup = BeautifulSoup(h, "html.parser")
+
+    def render(node):
+        # Text node
+        if NavigableString is not None and isinstance(node, NavigableString):
+            return _escape_text_for_para(str(node))
+        if Tag is None or not isinstance(node, Tag):
+            return ""
+
+        name = (node.name or "").lower()
+        if name in ("strong", "b"):
+            inner = "".join(render(c) for c in node.children)
+            return f"<b>{inner}</b>"
+        if name in ("em", "i"):
+            inner = "".join(render(c) for c in node.children)
+            return f"<i>{inner}</i>"
+        if name == "u":
+            inner = "".join(render(c) for c in node.children)
+            return f"<u>{inner}</u>"
+        if name == "br":
+            return "<br/>"
+
+        if name == "a":
+            href = str(node.get("href", "")).strip()
+            inner = "".join(render(c) for c in node.children)
+            if not inner:
+                inner = _escape_text_for_para(node.get_text(" ", strip=True))
+            if href:
+                return f'<link href="{_escape_attr(href)}">{inner}</link>'
+            return inner
+
+        if name in ("p", "div"):
+            inner = "".join(render(c) for c in node.children).strip()
+            if not inner:
+                return "<br/>"
+            return inner + "<br/><br/>"
+
+        if name in ("ul", "ol"):
+            items = []
+            for li in node.find_all("li", recursive=False):
+                li_inner = "".join(render(c) for c in li.children).strip()
+                if li_inner:
+                    items.append(f"• {li_inner}")
+            if not items:
+                return ""
+            return "<br/>".join(items) + "<br/><br/>"
+
+        if name == "li":
+            inner = "".join(render(c) for c in node.children).strip()
+            return inner
+
+        # Default: recurse
+        return "".join(render(c) for c in node.children)
+
+    out = "".join(render(n) for n in soup.contents)
+    out = re.sub(r"(<br/>\s*){3,}", "<br/><br/>", out)
+    return out.strip()
+
+
 def _htmlize(text: str) -> str:
-    """Convert rich cell content into safe, simple HTML paragraphs for ReportLab."""
+    """Convert cell content to ReportLab Paragraph markup.
+
+    - HTML: converted (Quill)
+    - Non-HTML: treated as Markdown/plain
+    """
     if text is None:
         return ""
     s = str(text)
-    s = s.replace("\r\n", "\n").replace("<BR>", "\n").replace("<br/>", "\n").replace("<br>", "\n")
-    # Escape & < >
-    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    # restore intended breaks and convert to <br/>
-    s = s.replace("&lt;br&gt;", "\n").replace("&lt;br/&gt;", "\n")
-    s = s.replace("\n", "<br/>")
-    return s
+    # Normalize line endings for Markdown/plain
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    if _looks_like_html(s):
+        return _html_to_reportlab(s)
+    return _markdown_to_reportlab(s)
+
+
+
+
+def _extract_embedded_images_from_html(html: str) -> tuple[str, list[tuple[str, bytes]]]:
+    """
+    Replace <img> tags whose src is a data URI with token paragraphs and return:
+      (html_without_images, [(token, image_bytes), ...])
+
+    This allows us to render images as ReportLab Image flowables while keeping text formatting.
+    """
+    if not html:
+        return "", []
+    h = str(html)
+
+    if not _BS4_AVAILABLE:
+        # Fallback: strip <img> tags (images won't render without bs4 parsing)
+        h2 = re.sub(r'(?is)<\s*img[^>]*>', '', h)
+        return h2, []
+
+    soup = BeautifulSoup(h, "html.parser")
+    images: list[tuple[str, bytes]] = []
+    img_idx = 0
+
+    for img in soup.find_all("img"):
+        src = str(img.get("src", "")).strip()
+        token = f"__WS_IMG_{img_idx}__"
+
+        # Try to decode embedded base64 image
+        img_bytes: bytes | None = None
+        if src.lower().startswith("data:image") and "base64," in src:
+            try:
+                b64 = src.split("base64,", 1)[1]
+                img_bytes = base64.b64decode(b64, validate=False)
+            except Exception:
+                img_bytes = None
+
+        if img_bytes:
+            images.append((token, img_bytes))
+            # Put token in its own paragraph to avoid being wrapped by inline tags
+            p = soup.new_tag("p")
+            p.string = token
+            img.replace_with(p)
+            img_idx += 1
+        else:
+            # Non-embedded or invalid image: remove tag (keep nothing)
+            img.decompose()
+
+    return str(soup), images
+
+
+def _rich_to_flowables(text: str, style: ParagraphStyle, max_width_pts: float, max_height_pts: float = 80*mm):
+    """
+    Convert rich text (Quill HTML / Markdown) into a list of ReportLab flowables.
+    Supports embedded images (data URIs) by inserting ReportLab Image flowables.
+    """
+    if text is None:
+        return []
+    s = str(text).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return []
+
+    # HTML path (Quill)
+    if _looks_like_html(s):
+        html_wo_imgs, imgs = _extract_embedded_images_from_html(s)
+        markup = _html_to_reportlab(html_wo_imgs)
+
+        # No images: just one paragraph
+        if not imgs:
+            return [Paragraph(markup, style)]
+
+        # Split markup by tokens and insert images
+        flow = []
+        remaining = markup
+        for token, img_bytes in imgs:
+            parts = remaining.split(token, 1)
+            before = parts[0]
+            remaining = parts[1] if len(parts) > 1 else ""
+
+            if before.strip():
+                flow.append(Paragraph(before, style))
+
+            try:
+                rl_img = RLImage(io.BytesIO(img_bytes))
+                rl_img._restrictSize(max_width_pts, max_height_pts)
+                flow.append(rl_img)
+                flow.append(Spacer(1, 2*mm))
+            except Exception:
+                flow.append(Paragraph("[Image could not be rendered]", style))
+
+        if remaining.strip():
+            flow.append(Paragraph(remaining, style))
+
+        return flow
+
+    # Markdown / plain path
+    return [Paragraph(_markdown_to_reportlab(s), style)]
 
 
 def _escape_attr(val: str) -> str:
@@ -862,29 +1422,29 @@ def build_full_report_pdf(df: pd.DataFrame, project_name: str, rating_system: st
 
                 if approach:
                     story.append(Paragraph("<b>Approach</b>", small))
-                    story.append(Paragraph(_htmlize(approach), small))
+                    story.extend(_rich_to_flowables(approach, small, max_w))
 
                 if req:
                     story.append(Paragraph("<b>Requirement</b>", small))
-                    story.append(Paragraph(_htmlize(req), small))
+                    story.extend(_rich_to_flowables(req, small, max_w))
 
                 if thr:
                     story.append(Paragraph("<b>Thresholds</b>", small))
-                    story.append(Paragraph(_htmlize(thr), small))
+                    story.extend(_rich_to_flowables(thr, small, max_w))
 
                 if and_:
                     story.append(Paragraph("<b>And</b>", small))
-                    story.append(Paragraph(_htmlize(and_), small))
+                    story.extend(_rich_to_flowables(and_, small, max_w))
                 if or_:
                     story.append(Paragraph("<b>Or</b>", small))
-                    story.append(Paragraph(_htmlize(or_), small))
+                    story.extend(_rich_to_flowables(or_, small, max_w))
 
                 if docu:
                     story.append(Paragraph("<b>Documentation</b>", small))
-                    story.append(Paragraph(_htmlize(docu), small))
+                    story.extend(_rich_to_flowables(docu, small, max_w))
                 if refs:
                     story.append(Paragraph("<b>Referenced Standards</b>", small))
-                    story.append(Paragraph(_htmlize(refs), small))
+                    story.extend(_rich_to_flowables(refs, small, max_w))
 
                 # Credit URL (printed in PDF export)
                 # Prefer row-level URL, fallback to credit-level URL within the loaded dataframe
@@ -911,7 +1471,7 @@ def build_full_report_pdf(df: pd.DataFrame, project_name: str, rating_system: st
                     _u = str(credit_url).strip()
                     if _u:
                         # Make it clickable if supported by the PDF viewer
-                        story.append(Paragraph(f'<link href="{_htmlize(_u)}">{_htmlize(_u)}</link>', small))
+                        story.append(Paragraph(f'<link href="{_escape_attr(_u)}">{_htmlize(_u)}</link>', small))
 
                 story.append(Spacer(1, 4*mm))
             story.append(Spacer(1, 6*mm))
@@ -1089,44 +1649,25 @@ def build_filtered_catalog_report_pdf(
                 if effort:      story.append(Paragraph(f"<b>Effort:</b> {_htmlize(effort)}", small))
                 if responsible: story.append(Paragraph(f"<b>Responsible:</b> {_htmlize(responsible)}", small))
 
-                # Approach
-                if approach:
-                    story.append(Paragraph("<b>Approach</b>", small))
-                    story.append(Paragraph(_htmlize(approach), small))
-
-                # Stakeholder comments
-                if responsible:
-                    assigned = [t for t in split_tokens(responsible) if t in RESPONSIBLE_OPTIONS]
-                else:
-                    assigned = []
-                # Stakeholder comments for all assigned Responsible stakeholders
-                for s in assigned:
-                    col = comment_colname(s)
-                    if col in row_df.columns:
-                        comm = _first(row_df.get(col))
-                        if comm:
-                            story.append(Paragraph(f'<b>Comments "{_htmlize(s)}"</b>', small))
-                            story.append(Paragraph(_htmlize(comm), small))
-
                 # Requirement content
                 if req:
                     story.append(Paragraph("<b>Requirement</b>", small))
-                    story.append(Paragraph(_htmlize(req), small))
+                    story.extend(_rich_to_flowables(req, small, max_w))
                 if thr:
                     story.append(Paragraph("<b>Thresholds</b>", small))
-                    story.append(Paragraph(_htmlize(thr), small))
+                    story.extend(_rich_to_flowables(thr, small, max_w))
                 if and_:
                     story.append(Paragraph("<b>And</b>", small))
-                    story.append(Paragraph(_htmlize(and_), small))
+                    story.extend(_rich_to_flowables(and_, small, max_w))
                 if or_:
                     story.append(Paragraph("<b>Or</b>", small))
-                    story.append(Paragraph(_htmlize(or_), small))
+                    story.extend(_rich_to_flowables(or_, small, max_w))
                 if docu:
                     story.append(Paragraph("<b>Documentation</b>", small))
-                    story.append(Paragraph(_htmlize(docu), small))
+                    story.extend(_rich_to_flowables(docu, small, max_w))
                 if refs:
                     story.append(Paragraph("<b>Referenced Standards</b>", small))
-                    story.append(Paragraph(_htmlize(refs), small))
+                    story.extend(_rich_to_flowables(refs, small, max_w))
 
                 # Credit URL (clickable)
                 if credit_url:
@@ -1136,6 +1677,21 @@ def build_filtered_catalog_report_pdf(
                         # Render a clickable hyperlink in PDF (viewer-dependent)
                         story.append(Paragraph(f'<link href="{_escape_attr(_u)}">{_htmlize(_u)}</link>', small))
 
+
+                # Approach (Werner Sobek input) — printed after Credit URL
+                if approach:
+                    story.append(Paragraph("<b>Approach</b>", small))
+                    story.extend(_rich_to_flowables(approach, small, max_w))
+
+                # Stakeholder comments — printed after Approach
+                assigned = [t for t in split_tokens(responsible) if t in RESPONSIBLE_OPTIONS] if responsible else []
+                for s in assigned:
+                    col = comment_colname(s)
+                    if col in row_df.columns:
+                        comm = _first(row_df.get(col))
+                        if comm:
+                            story.append(Paragraph(f'<b>Comments "{_htmlize(s)}"</b>', small))
+                            story.extend(_rich_to_flowables(comm, small, max_w))
                 story.append(Spacer(1, 4*mm))
 
             story.append(Spacer(1, 6*mm))
@@ -1441,16 +1997,15 @@ with tab_select:
     # Requirement
     if not req_series.empty:
         requirement = str(req_series.iloc[0])
-        requirement_html = requirement.replace("\r\n", "<br>").replace("\n", "<br>")
         st.markdown("---")
         st.write("### Requirement:")
-        st.markdown(requirement_html, unsafe_allow_html=True)
+        render_rich_readonly(requirement)
 
     # Thresholds
     if 'Thresholds' in df.columns and not thresholds_series.empty:
-        thresholds_html = str(thresholds_series.iloc[0]).replace("\r\n", "<br>").replace("\n", "<br>")
+        thresholds_txt = str(thresholds_series.iloc[0])
         st.write("### Thresholds:")
-        st.markdown(thresholds_html, unsafe_allow_html=True)
+        render_rich_readonly(thresholds_txt)
 
     # Documentation & Referenced Standards
     doc_col = 'Documentation' if 'Documentation' in df.columns else None
@@ -1460,15 +2015,13 @@ with tab_select:
         _doc_series = df.loc[mask, doc_col].dropna().drop_duplicates()
         if not _doc_series.empty:
             st.write("### Documentation:")
-            _doc_html = str(_doc_series.iloc[0]).replace("\r\n", "<br>").replace("\n", "<br>")
-            st.markdown(_doc_html, unsafe_allow_html=True)
+            render_rich_readonly(str(_doc_series.iloc[0]))
 
     if ref_col:
         _ref_series = df.loc[mask, ref_col].dropna().drop_duplicates()
         if not _ref_series.empty:
             st.write("### Referenced Standards:")
-            _ref_html = str(_ref_series.iloc[0]).replace("\r\n", "<br>").replace("\n", "<br>")
-            st.markdown(_ref_html, unsafe_allow_html=True)
+            render_rich_readonly(str(_ref_series.iloc[0]))
 
     # Credit URL (embedded preview)
     credit_url = get_best_credit_url(df, mask, selected_category, selected_credit_id, selected_credit)
@@ -1499,6 +2052,7 @@ with tab_select:
         permit_key = f"permit::{key_base}"
 
         st.caption("#### Input Werner Sobek")
+        st.markdown("**Project\'s approach for this credit**")
         # ---- Approach (text) ----
         current_df_approach = ""
         _ser_appr = df.loc[mask, 'Approach'].dropna().astype(str)
@@ -1508,17 +2062,35 @@ with tab_select:
         if approach_key not in st.session_state:
             st.session_state[approach_key] = current_df_approach
 
-        new_text = st.text_area(
-            "Project's Strategy",
-            key=approach_key,
-            height=180,
-            help="Describe design team strategy to meet credit's requirement."
-        )
+        # ---- Approach (rich text via Quill) ----
+        current_html_approach = _ensure_quill_html(current_df_approach)
 
-        if new_text != current_df_approach:
-            idx = st.session_state.df.loc[mask].index
-            st.session_state.df.loc[idx, 'Approach'] = new_text
-            st.caption("Approach autosaved ✓")
+        if _QUILL_AVAILABLE:
+            new_html = st_quill(
+                value=st.session_state.get(approach_key, current_html_approach) or current_html_approach,
+                html=True,
+                key=approach_key,
+                placeholder="Describe design team strategy to meet credit's requirement..."
+            )
+            new_html = _normalize_quill_html(new_html)
+            if _normalize_quill_html(current_html_approach) != new_html:
+                idx = st.session_state.df.loc[mask].index
+                st.session_state.df.loc[idx, 'Approach'] = new_html
+                st.caption("Approach autosaved ✓")
+        else:
+            # Fallback to plain text
+            if approach_key not in st.session_state:
+                st.session_state[approach_key] = current_df_approach
+            new_text = st.text_area(
+                "Project's Strategy",
+                key=approach_key,
+                height=180,
+                help="Describe design team strategy to meet credit's requirement."
+            )
+            if new_text != current_df_approach:
+                idx = st.session_state.df.loc[mask].index
+                st.session_state.df.loc[idx, 'Approach'] = new_text
+                st.caption("Approach autosaved ✓")
 
         # ---- Status (dropdown) ----
         current_df_status = "Not Pursued"
@@ -1665,6 +2237,8 @@ with tab_select:
         else:
             st.caption("#### Input Stakeholders")
             for _stakeholder in assigned_stakeholders:
+                # Visible label for each stakeholder input (Quill editors have no native Streamlit label)
+                st.markdown(f'**Comments "{_stakeholder}"**')
                 _col = comment_colname(_stakeholder)
                 if _col not in st.session_state.df.columns:
                     st.session_state.df[_col] = np.nan
@@ -1679,17 +2253,37 @@ with tab_select:
                 if _k not in st.session_state:
                     st.session_state[_k] = _current
 
-                _new = st.text_area(
-                    f'Comments "{_stakeholder}"',
-                    key=_k,
-                    height=180,
-                    help=f"Input from {_stakeholder} regarding how to meet this credit/path during Design."
-                )
+                # Stakeholder comment (rich text via Quill)
+                _current_html = _ensure_quill_html(_current)
 
-                if _new != _current:
-                    _idx = st.session_state.df.loc[mask].index
-                    st.session_state.df.loc[_idx, _col] = _new
-                    st.caption(f'Comment "{_stakeholder}" autosaved ✓')
+                if _QUILL_AVAILABLE:
+                    _new_html = st_quill(
+                        value=st.session_state.get(_k, _current_html) or _current_html,
+                        html=True,
+                        key=_k,
+                        placeholder=f"Input from {_stakeholder} regarding how to meet this credit/path during Design..."
+                    )
+                    _new_html = _normalize_quill_html(_new_html)
+                    if _normalize_quill_html(_current_html) != _new_html:
+                        _idx = st.session_state.df.loc[mask].index
+                        st.session_state.df.loc[_idx, _col] = _new_html
+                        st.caption(f'Comment "{_stakeholder}" autosaved ✓')
+                else:
+                    if _k not in st.session_state:
+                        st.session_state[_k] = _current
+                    _new = st.text_area(
+                        f'Comments "{_stakeholder}"',
+                        key=_k,
+                        height=180,
+                        help=f"Input from {_stakeholder} regarding how to meet this credit/path during Design."
+                    )
+                    if _new != _current:
+                        _idx = st.session_state.df.loc[mask].index
+                        st.session_state.df.loc[_idx, _col] = _new
+                        st.caption(f'Comment "{_stakeholder}" autosaved ✓')
+
+                # Visual separator between stakeholder inputs
+                st.markdown("---")
 
 
     # =========================
@@ -1732,8 +2326,18 @@ with tab_select:
     st.markdown("---")
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        export_df = st.session_state.df.drop(columns=['_opt_points'], errors='ignore')
-        export_df.to_excel(writer, sheet_name="LEED_V5_Requirements", index=False)
+        export_df = st.session_state.df.drop(columns=['_opt_points'], errors='ignore').copy()
+
+        # IMPORTANT: Excel cells are limited to 32,767 characters. Quill embeds pasted images as
+        # data-URI <img> tags, which are far longer than that. Before writing the workbook we:
+        # 1) Replace data-URI images with short wsasset://<id> references in the DF.
+        # 2) Store the base64 payloads (chunked) in a dedicated sheet (Embedded_Images).
+        export_df_for_excel, assets_df = _prepare_df_for_excel_with_assets(export_df)
+
+        export_df_for_excel.to_excel(writer, sheet_name="LEED_V5_Requirements", index=False)
+
+        if assets_df is not None and not assets_df.empty:
+            assets_df.to_excel(writer, sheet_name=EMBEDDED_IMAGES_SHEET, index=False)
 
         proj_out = pd.DataFrame([{
             "project_name": st.session_state.get("project_name", ""),
