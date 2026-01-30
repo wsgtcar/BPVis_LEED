@@ -80,7 +80,7 @@ RESPONSIBLE_OPTIONS = [
     "Owner", "Project Manager", "Operator", "Architect", "Landscape Architect", "Interior Architect",
     "MEP Engineer", "Structural Engineer", "Electrical Engineer", "Sustainability Consultant", "Building Physics",
     "Energy Engineer","Facility Manager", "Comissioning Authority", "Infrastructure Engineer",
-    "Simulation Expert", "Accoustic Engineer", "Lighting Designer", "Contractor", "Facade Designer"
+    "Simulation Expert", "Accoustic Engineer", "Lighting Designer", "Contractor", "Facade Designer", "Performance Testing Agent"
 ]
 RESPONSIBLE_DEFAULTS = ["Owner", "Sustainability Consultant", "Architect"]
 
@@ -2862,5 +2862,6 @@ with sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
+
 
 
