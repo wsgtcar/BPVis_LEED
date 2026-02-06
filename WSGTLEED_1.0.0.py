@@ -11,6 +11,7 @@ import openpyxl
 import base64
 import uuid
 import hashlib
+from functools import lru_cache
 from typing import Dict, List, Tuple, Optional
 
 
@@ -30,7 +31,44 @@ except Exception:
     NavigableString = None
     Tag = None
     _BS4_AVAILABLE = False
+
 from pathlib import Path
+
+# =======================
+# File/asset helpers (Streamlit Cloud-safe, avoids intermittent MediaFileStorageError on relative paths)
+# =======================
+APP_DIR = Path(__file__).resolve().parent
+
+def _abs_path(p: str | Path) -> Path:
+    """Resolve an app-relative path robustly (works on Streamlit Community Cloud)."""
+    pp = Path(p)
+    return pp if pp.is_absolute() else (APP_DIR / pp)
+
+@lru_cache(maxsize=256)
+def _read_bytes_cached(path_str: str) -> bytes | None:
+    """Read file bytes with process-level caching (reduces repeated file opens on reruns)."""
+    try:
+        return Path(path_str).read_bytes()
+    except Exception:
+        return None
+
+def asset_bytes(rel_path: str | Path) -> bytes | None:
+    """Return bytes for an asset in the repo, or None if missing/unreadable."""
+    ap = _abs_path(rel_path)
+    if not ap.exists() or not ap.is_file():
+        return None
+    return _read_bytes_cached(str(ap))
+
+def show_image(container, rel_path: str | Path, width: int | None = None) -> bool:
+    """Safely render an image from the repo; returns True on success."""
+    b = asset_bytes(rel_path)
+    if not b:
+        return False
+    try:
+        container.image(b, width=width)
+        return True
+    except Exception:
+        return False
 
 from streamlit import sidebar
 
@@ -42,12 +80,13 @@ from reportlab.lib import colors
 from reportlab.lib.units import mm
 import plotly.io as pio  # needs kaleido installed
 
+_PAGE_ICON = asset_bytes("Pamo_Icon_White.png") or "🌿"
+
 st.set_page_config(
     page_title="WSGT_LEED V5 Precheck Tool",
-    page_icon="Pamo_Icon_White.png",
+    page_icon=_PAGE_ICON,
     layout="wide"
 )
-
 color_map = {
     "Integrative Process, Planning and Assessments": "#962713",
     "Location and Transportation": "#B87400",
@@ -493,12 +532,12 @@ def _restore_embedded_images_into_df(df_: pd.DataFrame, xls_file) -> pd.DataFram
 # =========================
 # Sidebar — template download & file upload
 # =========================
-st.sidebar.image("Pamo_Icon_Black.png", width=80)
+show_image(st.sidebar, "Pamo_Icon_Black.png", width=80)
 st.sidebar.write("## BPVis LEED V5 Precheck")
 st.sidebar.write("Version 1.1.0")
 
 st.sidebar.markdown("### Download Template")
-template_path = Path("templates/LEED v5 BD+C Requirements.xlsx")
+template_path = _abs_path("templates/LEED v5 BD+C Requirements.xlsx")
 if template_path.exists():
     with open(template_path, "rb") as file:
         st.sidebar.download_button(
@@ -517,10 +556,9 @@ uploaded_file = st.sidebar.file_uploader("Upload Excel File", type="xlsx")
 # =========================
 col1, col2 = st.columns(2)
 with col2:
-    logo_path = Path("WS_Logo.jpg")
-    if logo_path.exists():
-        st.image(str(logo_path), width=900)
-
+    _logo_bytes = asset_bytes("WS_Logo.jpg")
+    if _logo_bytes:
+        st.image(_logo_bytes, width=900)
 # --- Defaults
 if "project_name" not in st.session_state:
     st.session_state["project_name"] = "LEED V5 Project"
@@ -2489,13 +2527,13 @@ with tab_dashboard:
     with col2:
         st.metric("Total Points", f"{total_points:.0f}")
         if certification_level == "LEED V5 Certified":
-            st.image("LEED_Certified.png", width=200)
+            show_image(st, "LEED_Certified.png", width=200)
         if certification_level == "LEED V5 Silver":
-            st.image("LEED_Silver.png", width=200)
+            show_image(st, "LEED_Silver.png", width=200)
         if certification_level == "LEED V5 Gold":
-            st.image("LEED_Gold.png", width=200)
+            show_image(st, "LEED_Gold.png", width=200)
         if certification_level == "LEED V5 Platinum":
-            st.image("LEED_Platinum.png", width=200)
+            show_image(st, "LEED_Platinum.png", width=200)
         st.metric("Certification", certification_level)
 
         st.metric("Points to Next Level", "—" if next_threshold is None else f"{points_to_next:.0f}")
@@ -2852,7 +2890,7 @@ with tab_dashboard:
 
 with sidebar:
     st.caption("*A product of*")
-    st.image("WS_Logo.png", width=300)
+    show_image(st, "WS_Logo.png", width=300)
     st.caption("Werner Sobek Green Technologies GmbH")
     st.caption("Fachgruppe Simulation")
     st.markdown("---")
@@ -2862,6 +2900,3 @@ with sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
-
-
-
